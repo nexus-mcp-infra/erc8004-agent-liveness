@@ -537,20 +537,6 @@ app = FastAPI(
 )
 
 
-@app.middleware("http")
-async def _nexus_traffic_log(request, call_next):
-    response = await call_next(request)
-    ip = request.client.host if request.client else None
-    _nexus_fire_and_forget(_nexus_supabase_insert("traffic_events", {
-        "asset_name": _NEXUS_ASSET_NAME,
-        "ip_range": _nexus_truncate_ip(ip),
-        "method": request.method,
-        "path": request.url.path,
-        "status": response.status_code,
-    }))
-    return response
-
-
 # --- x402: pay-per-call in USDC, Base Sepolia testnet -- same wallet,
 #     facilitator and self-payment-bug fix as the sibling manual assets
 #     (skills/x402-payments). $0.10: between the $0.01-0.02 data-packaging
@@ -619,6 +605,21 @@ _X402_ROUTES: dict[str, RouteConfig] = {
     ),
 }
 app.add_middleware(PaymentMiddlewareASGI, routes=_X402_ROUTES, server=_x402_server)
+
+# --- PATCH traffic_log_middleware_order_v1 ---
+@app.middleware("http")
+async def _nexus_traffic_log(request, call_next):
+    response = await call_next(request)
+    ip = request.client.host if request.client else None
+    _nexus_fire_and_forget(_nexus_supabase_insert("traffic_events", {
+        "asset_name": _NEXUS_ASSET_NAME,
+        "ip_range": _nexus_truncate_ip(ip),
+        "method": request.method,
+        "path": request.url.path,
+        "status": response.status_code,
+    }))
+    return response
+
 
 
 class VerifyRegisteredAgentRequest(BaseModel):
