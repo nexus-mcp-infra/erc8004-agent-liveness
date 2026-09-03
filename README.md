@@ -1,7 +1,8 @@
 # ERC-8004 Agent Liveness
 
 Checks whether an agent registered in the real ERC-8004 "Trustless Agents" Identity Registry (Base
-mainnet) is actually alive right now -- not just that it was registered once. NEXUS candidate #10 --
+Sepolia testnet -- see "Chain scope" below for why, despite payment being real USDC on Base mainnet)
+is actually alive right now -- not just that it was registered once. NEXUS candidate #10 --
 **manual build, not FORGE-generated**, same manual-Cloud-Run-asset pattern as candidates #3/#4/#6/#8/#9/#13/#16.
 
 - `POST /verify-registered-agent {"agent_id": 3}` -- **$0.10/call.**
@@ -52,23 +53,53 @@ file (3 URI schemes) and picking a real endpoint out of its `endpoints` array to
 
 ## Chain scope
 
-Base mainnet -- both the x402 payment rail (real USDC) and the on-chain `IdentityRegistry`/`ReputationRegistry`
-reads, same two addresses as originally verified on Base Sepolia testnet (see "Grounding" above), since
-the ERC-8004 reference deployment uses the same addresses across chains. This asset still doesn't expose a
-caller-selectable chain -- no evidence a buyer needs one.
+**Split, deliberately.** x402 payment settles in real USDC on **Base mainnet**. The on-chain
+`IdentityRegistry`/`ReputationRegistry` reads -- the actual identity/liveness check -- are on **Base Sepolia
+testnet**, not mainnet. This asset still doesn't expose a caller-selectable chain -- no evidence a buyer needs
+one for either rail.
 
-## Mainnet cutover (2026-09-03)
+## Mainnet cutover (2026-09-03) and same-day partial revert
 
 Originally built and measured on Base Sepolia testnet (x402 payment + registry reads both). Cut over to Base
-mainnet: x402 settlement moved to the CDP facilitator (`create_facilitator_config()`, same swap already applied
-to `ws`/`live-entity-verification`), the payto wallet moved to `NEXUS_X402_PAYTO_ADDRESS` (fail-fast env var,
-no placeholder default), and `BASE_RPC_URL` (renamed from `BASE_SEPOLIA_RPC_URL`, default
-`https://mainnet.base.org`) now points the registry reads at Base mainnet too, at the same two contract
-addresses. That address reuse across chains was confirmed by the operator directly on Basescan before this
-cutover, not independently re-verified from the session that made the code change (no outbound network access
-to `mainnet.base.org` from that environment) -- the real payment-plus-registry-read verification against a
-known-registered mainnet agent is the actual live confirmation, done as part of this cutover's rollout, not
-this doc.
+mainnet same session: x402 settlement moved to the CDP facilitator (`create_facilitator_config()`, same swap
+already applied to `ws`/`live-entity-verification`), the payto wallet moved to `NEXUS_X402_PAYTO_ADDRESS`
+(fail-fast env var, no placeholder default), and the registry RPC moved to Base mainnet too, at the same two
+contract addresses -- that address reuse across chains was confirmed by the operator directly on Basescan
+before the cutover, not independently re-verified from the session that made the code change (no outbound
+network access to `mainnet.base.org` from that environment).
+
+**Reverted a few hours later, registry-read side only.** Two independent sources (a live `eth_call`, and
+Basescan's own "Read as Proxy" tab) confirmed `ownerOf`/`balanceOf` both revert with "execution reverted, no
+data" against the IdentityRegistry proxy (`0x8004A818BFB912233c491871b3d84c89A494BD9e`) on Base mainnet --
+while `register()` against that same proxy demonstrably works (19 real confirmed mint transactions). The
+implementation contract behind the proxy on mainnet (`0xd53dE688e0b0ad436FBdbDa00036832FF6499234`, confirmed
+via Basescan's proxy-implementation slot) has **no verified source or ABI anywhere on Etherscan/Basescan** --
+so there's no way to confirm the deployed mainnet bytecode still matches
+`github.com/erc-8004/erc-8004-contracts` (commit b9e466c) the way the Sepolia deployment's bytecode was
+originally confirmed (see "Grounding" above). Continuing to call `ownerOf`/`tokenURI`/`getClients`/`getSummary`
+by name against unverified mainnet bytecode risked the exact failure this asset exists to catch, but aimed at
+its own buyers instead: a plausible wrong answer (`AGENT_NOT_FOUND` for a real agent) charged for as if
+correct.
+
+`BASE_RPC_URL` was reverted to `BASE_SEPOLIA_RPC_URL` (default back to `https://sepolia.base.org`) so the
+registry read is on the chain whose bytecode is actually verified working, while `_X402_NETWORK` and the CDP
+facilitator stay on Base mainnet -- payment did not revert, only the identity check did. Every buyer-facing
+surface (agent-card, OpenAPI descriptions, this README) says this split explicitly rather than implying the
+whole asset moved to mainnet.
+
+## Pending: confirm the real mainnet implementation before re-attempting this cutover
+
+Not resolved, left open on purpose rather than guessed at:
+
+- Decompile the bytecode at the mainnet implementation address
+  (`0xd53dE688e0b0ad436FBdbDa00036832FF6499234`) directly, since no verified source exists to read instead, OR
+- Contact the ERC-8004 team/Foundation to ask for the real source/ABI actually deployed on Base mainnet at
+  that implementation address.
+
+Only once one of those confirms the real function names/signatures (which may or may not match
+`ownerOf`/`tokenURI`/`getClients`/`getSummary` from the Sepolia-verified reference source) should the registry
+read be pointed at Base mainnet again -- and even then, re-verify live against real registered mainnet agents
+before trusting it, the same discipline already applied to the original Sepolia grounding.
 
 ## Deploy target: Cloud Run
 

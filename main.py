@@ -41,17 +41,36 @@ all)**:
 
 **Mainnet cutover (2026-09-03)**: x402 payment settlement moved from Base
 Sepolia testnet to Base mainnet (real USDC, CDP facilitator -- same pattern
-already applied to `ws`/`live-entity-verification`), and the on-chain
-registry RPC moved with it -- `IdentityRegistry`/`ReputationRegistry` are
-now read on Base mainnet at the *same two addresses* used on Sepolia above.
-That address reuse was confirmed by the operator directly on Basescan
-before this cutover, not independently re-verified from the session that
-made this change (no outbound network access to `mainnet.base.org` from
-that environment) -- treat the original Sepolia bytecode confirmation
-above as historical, and this cutover's own rollout checklist (a real
-`verify_registered_agent`/`POST /verify-registered-agent` call against an
-already-registered agent) as the live confirmation that mainnet reads
-work, not this docstring.
+already applied to `ws`/`live-entity-verification`). This part is
+confirmed working.
+
+**Registry-read partial revert (2026-09-03, same day)**: the on-chain
+registry RPC was moved to Base mainnet alongside the payment rail in the
+cutover above, then reverted back to Base Sepolia testnet a few hours
+later after real evidence the mainnet side is broken: `ownerOf`/`balanceOf`
+both revert with "execution reverted, no data" against the PROXY address
+(`0x8004A818...`) on Base mainnet via the public RPC, confirmed from two
+independent sources (a live `eth_call`, and Basescan's own "Read as Proxy"
+tab) -- while `register()` against that same proxy demonstrably works (19
+real confirmed mint transactions). The implementation contract behind the
+proxy on mainnet (`0xd53dE688e0b0ad436FBdbDa00036832FF6499234`, confirmed
+via Basescan's proxy-implementation slot) has **no verified source or ABI
+on Etherscan/Basescan at all** -- so the deployed mainnet bytecode cannot
+currently be confirmed to match `github.com/erc-8004/erc-8004-contracts`
+(commit b9e466c) the way the Sepolia deployment's bytecode was confirmed
+line 20-23 below. Trusting `ownerOf`/`tokenURI`/`getClients`/`getSummary`
+by name against unverified mainnet bytecode risks exactly the failure mode
+this asset exists to prevent for its *buyers*: a plausible-looking wrong
+answer (`AGENT_NOT_FOUND` for a real agent) charged for as if it were
+right.
+
+Net result, current state: **x402 payment is real USDC on Base mainnet;
+the identity/liveness check itself still reads Base Sepolia testnet.**
+This is a deliberate, disclosed interim tradeoff, not an oversight -- see
+`_BASE_RPC` below and the buyer-facing text on `/verify-registered-agent`
+and the agent-card, which both say this explicitly. Revisit only after the
+mainnet implementation's real bytecode/ABI is confirmed (decompile, or the
+ERC-8004 team) -- see README "Pending".
 """
 
 import asyncio
@@ -94,14 +113,19 @@ from cdp.x402 import create_facilitator_config as _nexus_cdp_create_facilitator_
 _NEXUS_ASSET_NAME = "erc8004-agent-liveness"
 
 # ---------------------------------------------------------------
-# ERC-8004 registry config -- Base mainnet (moved from Base Sepolia testnet
-# in the 2026-09-03 cutover, see module docstring). Addresses + ABI subset
-# originally verified live against real deployed bytecode and real
-# registered agents on Sepolia; the same two addresses on mainnet were
-# confirmed by the operator on Basescan before this cutover, not
-# independently re-verified from the session that made this change.
+# ERC-8004 registry config -- Base SEPOLIA TESTNET (deliberately NOT Base
+# mainnet, as of the 2026-09-03 partial revert -- see module docstring).
+# The mainnet proxy's implementation has no verified source/ABI anywhere,
+# and ownerOf/balanceOf both revert against it in real testing -- reading
+# testnet here, where the bytecode IS verified against
+# github.com/erc-8004/erc-8004-contracts (commit b9e466c) and confirmed
+# working live, is safer than trusting unverified mainnet bytecode by
+# function name alone. x402 PAYMENT still settles on Base mainnet in real
+# USDC (see the x402 config further down) -- only this registry read is on
+# testnet. Revisit once the mainnet implementation's real ABI is confirmed
+# (see README "Pending").
 # ---------------------------------------------------------------
-_BASE_RPC = os.getenv("BASE_RPC_URL", "https://mainnet.base.org")
+_BASE_RPC = os.getenv("BASE_SEPOLIA_RPC_URL", "https://sepolia.base.org")
 _IDENTITY_REGISTRY_ADDRESS = "0x8004A818BFB912233c491871b3d84c89A494BD9e"
 _REPUTATION_REGISTRY_ADDRESS = "0x8004B663056A597Dffe9eCcC1965A193B7388713"
 
@@ -510,7 +534,8 @@ def _validate_agent_id(agent_id: int) -> int:
 @mcp.tool()
 async def verify_registered_agent(agent_id: int, ctx: Context = None) -> dict:
     """Checks whether an agent registered in the real ERC-8004 Identity
-    Registry (Base mainnet) is actually alive right now: resolves
+    Registry (Base Sepolia testnet -- see module docstring "Registry-read
+    partial revert" for why) is actually alive right now: resolves
     its on-chain registration file, then performs a real MCP `initialize`
     handshake against whatever endpoint it declares. verdict is one of
     AGENT_NOT_FOUND, REGISTRATION_FETCH_FAILED, REGISTERED_INACTIVE,
@@ -541,8 +566,10 @@ app = FastAPI(
     title="ERC-8004 Agent Liveness",
     description=(
         "Checks whether an agent registered in the real ERC-8004 Identity Registry (Base "
-        "mainnet) is actually alive right now -- resolves its on-chain registration file and performs "
-        "a real MCP handshake against its declared endpoint, not just a cached registration check."
+        "Sepolia testnet) is actually alive right now -- resolves its on-chain registration file and performs "
+        "a real MCP handshake against its declared endpoint, not just a cached registration check. "
+        "Payment for this check settles in real USDC on Base mainnet even though the registry read "
+        "itself is on testnet -- see /verify-registered-agent's own description for why."
     ),
     version="1.0.0",
     contact={"email": "dasaanrod@gmail.com"},
@@ -694,7 +721,9 @@ async def _nexus_traffic_log(request, call_next):
 
 class VerifyRegisteredAgentRequest(BaseModel):
     agent_id: Annotated[int, Field(..., ge=0, le=_MAX_AGENT_ID,
-        description="ERC-8004 IdentityRegistry token ID (agentId) on Base mainnet.")]
+        description="ERC-8004 IdentityRegistry token ID (agentId) on Base Sepolia testnet "
+                    "(the registry read is on testnet even though payment is real USDC on Base mainnet -- "
+                    "see this endpoint's own docstring).")]
 
 
 class RegistrationInfo(BaseModel):
@@ -736,8 +765,14 @@ class VerifyRegisteredAgentResponse(BaseModel):
     },
 )
 async def verify_registered_agent_endpoint(payload: VerifyRegisteredAgentRequest) -> dict:
-    """Checks whether an ERC-8004-registered agent (Base mainnet) is
-    actually alive right now.
+    """Checks whether an ERC-8004-registered agent is actually alive right
+    now. The registry read (this endpoint's actual identity check) is
+    against Base Sepolia testnet, not mainnet -- the mainnet proxy's
+    implementation has no verified source/ABI anywhere and real reads
+    against it revert, so this deliberately reads the registry whose
+    bytecode IS verified working. Payment is still real USDC on Base
+    mainnet regardless (see below) -- this is a disclosed interim
+    tradeoff, not a bug.
 
     `verdict` meanings:
     - AGENT_NOT_FOUND: no agent is registered with this agent_id (ownerOf reverted).
@@ -820,7 +855,9 @@ async def agent_card() -> dict:
                 f"methods. POST /verify-registered-agent is charged {_X402_PRICE} via x402 (Base mainnet, "
                 "real USDC); the MCP tool is currently free -- see README. Payment settles "
                 "BEFORE this handler runs: a call is charged even on AGENT_NOT_FOUND or a 422. Checks the "
-                "real ERC-8004 Identity Registry on Base mainnet -- no exclusive data access, the "
+                "real ERC-8004 Identity Registry on Base SEPOLIA TESTNET, not mainnet (payment is still real "
+                "mainnet USDC regardless -- the mainnet registry's implementation has no verified ABI and "
+                "real reads against it revert, see README) -- no exclusive data access, the "
                 "value is the real-time MCP liveness check a raw registry lookup can't give you."
             ),
         },
