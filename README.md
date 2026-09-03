@@ -1,7 +1,7 @@
 # ERC-8004 Agent Liveness
 
-Checks whether an agent registered in the real ERC-8004 "Trustless Agents" Identity Registry (Base Sepolia
-testnet) is actually alive right now -- not just that it was registered once. NEXUS candidate #10 --
+Checks whether an agent registered in the real ERC-8004 "Trustless Agents" Identity Registry (Base
+mainnet) is actually alive right now -- not just that it was registered once. NEXUS candidate #10 --
 **manual build, not FORGE-generated**, same manual-Cloud-Run-asset pattern as candidates #3/#4/#6/#8/#9/#13/#16.
 
 - `POST /verify-registered-agent {"agent_id": 3}` -- **$0.10/call.**
@@ -50,11 +50,25 @@ and `_mcp_handshake_check` are ported **verbatim** from `manual_assets/agent-ver
 asset-name constant. This asset's own contribution is upstream of that: resolving an ERC-8004 registration
 file (3 URI schemes) and picking a real endpoint out of its `endpoints` array to hand to that engine.
 
-## Chain scope, on purpose
+## Chain scope
 
-Base Sepolia testnet only -- same network every other x402 payment in this codebase already uses. ERC-8004 is
-also live on Base mainnet and Ethereum mainnet (verified live this session), but this asset doesn't expose a
-caller-selectable chain: no evidence a buyer needs mainnet for a 7-day probation candidate (CLAUDE.md SS3).
+Base mainnet -- both the x402 payment rail (real USDC) and the on-chain `IdentityRegistry`/`ReputationRegistry`
+reads, same two addresses as originally verified on Base Sepolia testnet (see "Grounding" above), since
+the ERC-8004 reference deployment uses the same addresses across chains. This asset still doesn't expose a
+caller-selectable chain -- no evidence a buyer needs one.
+
+## Mainnet cutover (2026-09-03)
+
+Originally built and measured on Base Sepolia testnet (x402 payment + registry reads both). Cut over to Base
+mainnet: x402 settlement moved to the CDP facilitator (`create_facilitator_config()`, same swap already applied
+to `ws`/`live-entity-verification`), the payto wallet moved to `NEXUS_X402_PAYTO_ADDRESS` (fail-fast env var,
+no placeholder default), and `BASE_RPC_URL` (renamed from `BASE_SEPOLIA_RPC_URL`, default
+`https://mainnet.base.org`) now points the registry reads at Base mainnet too, at the same two contract
+addresses. That address reuse across chains was confirmed by the operator directly on Basescan before this
+cutover, not independently re-verified from the session that made the code change (no outbound network access
+to `mainnet.base.org` from that environment) -- the real payment-plus-registry-read verification against a
+known-registered mainnet agent is the actual live confirmation, done as part of this cutover's rollout, not
+this doc.
 
 ## Deploy target: Cloud Run
 

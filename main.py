@@ -13,9 +13,10 @@ identities: real, verified on-chain lookups fused with a real, live MCP
 `initialize` handshake against whatever endpoint the agent's own
 registration file declares -- not a cached/simulated check.
 
-**Grounding, verified live this session (not assumed from any single
-source; a third-party summary of contract addresses was cross-checked
-against real on-chain bytecode before being trusted at all)**:
+**Grounding, verified live the session this asset was built (not assumed
+from any single source; a third-party summary of contract addresses was
+cross-checked against real on-chain bytecode before being trusted at
+all)**:
 - IdentityRegistry (`0x8004A818BFB912233c491871b3d84c89A494BD9e`) and
   ReputationRegistry (`0x8004B663056A597Dffe9eCcC1965A193B7388713`) on Base
   Sepolia both have real deployed bytecode (`eth_getCode`, non-empty,
@@ -38,12 +39,19 @@ against real on-chain bytecode before being trusted at all)**:
   timeout). Not reimplemented, not modified beyond renaming the asset-name
   constant, per the task brief's explicit instruction to reuse this engine.
 
-**Chain scope, on purpose**: Base Sepolia testnet only, same network every
-other x402 payment in this codebase already uses -- not because ERC-8004
-isn't live on Base/Ethereum mainnet too (it is, verified live), but because
-adding caller-selectable mainnet RPC calls widens scope without evidence a
-buyer needs it for a 7-day probation candidate (CLAUDE.md SS3: no feature
-without evidence it's needed).
+**Mainnet cutover (2026-09-03)**: x402 payment settlement moved from Base
+Sepolia testnet to Base mainnet (real USDC, CDP facilitator -- same pattern
+already applied to `ws`/`live-entity-verification`), and the on-chain
+registry RPC moved with it -- `IdentityRegistry`/`ReputationRegistry` are
+now read on Base mainnet at the *same two addresses* used on Sepolia above.
+That address reuse was confirmed by the operator directly on Basescan
+before this cutover, not independently re-verified from the session that
+made this change (no outbound network access to `mainnet.base.org` from
+that environment) -- treat the original Sepolia bytecode confirmation
+above as historical, and this cutover's own rollout checklist (a real
+`verify_registered_agent`/`POST /verify-registered-agent` call against an
+already-registered agent) as the live confirmation that mainnet reads
+work, not this docstring.
 """
 
 import asyncio
@@ -80,15 +88,20 @@ from x402.http.types import RouteConfig
 from x402.mechanisms.evm.exact import ExactEvmServerScheme
 from x402.schemas import Network
 from x402.server import x402ResourceServer
+# --- PATCH mainnet_cutover_erc8004_agent_liveness ---
+from cdp.x402 import create_facilitator_config as _nexus_cdp_create_facilitator_config
 
 _NEXUS_ASSET_NAME = "erc8004-agent-liveness"
 
 # ---------------------------------------------------------------
-# ERC-8004 registry config -- Base Sepolia testnet. Addresses + ABI subset
-# verified live against real deployed bytecode and real registered agents
-# this session, see module docstring.
+# ERC-8004 registry config -- Base mainnet (moved from Base Sepolia testnet
+# in the 2026-09-03 cutover, see module docstring). Addresses + ABI subset
+# originally verified live against real deployed bytecode and real
+# registered agents on Sepolia; the same two addresses on mainnet were
+# confirmed by the operator on Basescan before this cutover, not
+# independently re-verified from the session that made this change.
 # ---------------------------------------------------------------
-_BASE_SEPOLIA_RPC = os.getenv("BASE_SEPOLIA_RPC_URL", "https://sepolia.base.org")
+_BASE_RPC = os.getenv("BASE_RPC_URL", "https://mainnet.base.org")
 _IDENTITY_REGISTRY_ADDRESS = "0x8004A818BFB912233c491871b3d84c89A494BD9e"
 _REPUTATION_REGISTRY_ADDRESS = "0x8004B663056A597Dffe9eCcC1965A193B7388713"
 
@@ -116,7 +129,7 @@ _REPUTATION_ABI = [
      "stateMutability": "view", "type": "function"},
 ]
 
-_w3 = Web3(Web3.HTTPProvider(_BASE_SEPOLIA_RPC, request_kwargs={"timeout": 10}))
+_w3 = Web3(Web3.HTTPProvider(_BASE_RPC, request_kwargs={"timeout": 10}))
 _identity_contract = _w3.eth.contract(
     address=Web3.to_checksum_address(_IDENTITY_REGISTRY_ADDRESS), abi=_IDENTITY_ABI)
 _reputation_contract = _w3.eth.contract(
@@ -497,7 +510,7 @@ def _validate_agent_id(agent_id: int) -> int:
 @mcp.tool()
 async def verify_registered_agent(agent_id: int, ctx: Context = None) -> dict:
     """Checks whether an agent registered in the real ERC-8004 Identity
-    Registry (Base Sepolia testnet) is actually alive right now: resolves
+    Registry (Base mainnet) is actually alive right now: resolves
     its on-chain registration file, then performs a real MCP `initialize`
     handshake against whatever endpoint it declares. verdict is one of
     AGENT_NOT_FOUND, REGISTRATION_FETCH_FAILED, REGISTERED_INACTIVE,
@@ -527,8 +540,8 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="ERC-8004 Agent Liveness",
     description=(
-        "Checks whether an agent registered in the real ERC-8004 Identity Registry (Base Sepolia "
-        "testnet) is actually alive right now -- resolves its on-chain registration file and performs "
+        "Checks whether an agent registered in the real ERC-8004 Identity Registry (Base "
+        "mainnet) is actually alive right now -- resolves its on-chain registration file and performs "
         "a real MCP handshake against its declared endpoint, not just a cached registration check."
     ),
     version="1.0.0",
@@ -585,15 +598,19 @@ class _NexusMcpListenTimeoutMiddleware:
 app.add_middleware(_NexusMcpListenTimeoutMiddleware)
 
 
-# --- x402: pay-per-call in USDC, Base Sepolia testnet -- same wallet,
-#     facilitator and self-payment-bug fix as the sibling manual assets
+# --- x402: pay-per-call in USDC, Base mainnet -- same wallet, facilitator
+#     and self-payment-bug fix as the sibling manual assets
 #     (skills/x402-payments). $0.10: between the $0.01-0.02 data-packaging
 #     tier and agent-verification-api's $0.35 multi-signal-ensemble tier --
 #     this does 2 real on-chain reads, 1 real registration-file fetch
 #     (data:/ipfs:/https:), and 1 real MCP handshake, but no paid WHOIS
 #     spend and no 4-signal Bayesian fusion. ---
-_X402_EVM_ADDRESS = os.getenv("X402_WALLET_ADDRESS", "0xYOUR_WALLET_ADDRESS_HERE")
-_X402_NETWORK: Network = "eip155:84532"  # Base Sepolia testnet
+# --- PATCH mainnet_cutover_erc8004_agent_liveness ---
+# Wallet read from env, fail-fast (no placeholder default) -- same pattern
+# as ws/live-entity-verification: if it's missing, boot must fail loudly
+# instead of silently issuing 402 challenges that can never settle.
+_X402_EVM_ADDRESS = os.environ["NEXUS_X402_PAYTO_ADDRESS"]
+_X402_NETWORK: Network = "eip155:8453"  # Base mainnet
 _X402_PRICE = os.getenv("X402_PRICE", "$0.10")
 
 if not _X402_PRICE or not _X402_PRICE.startswith("$"):
@@ -612,14 +629,19 @@ _looks_like_evm_address = (
 )
 if not _looks_like_evm_address:
     print(
-        f"[WARN] X402_WALLET_ADDRESS ({_X402_EVM_ADDRESS!r}) doesn't look like a "
+        f"[WARN] NEXUS_X402_PAYTO_ADDRESS ({_X402_EVM_ADDRESS!r}) doesn't look like a "
         "real EVM address (expected '0x' + 40 hex chars). The server will still "
         "boot and issue 402 challenges, but payments will have nowhere real to "
         "settle. See README.md.",
         file=sys.stderr,
     )
 
-_x402_facilitator = HTTPFacilitatorClient(FacilitatorConfig(url="https://x402.org/facilitator"))
+# CDP Facilitator (not x402.org) -- same swap already applied to
+# ws/live-entity-verification/similarity-search-api: indexes real
+# verify/settle calls in Coinbase's Bazaar. create_facilitator_config()
+# reads CDP_API_KEY_ID/CDP_API_KEY_SECRET from the environment -- must be
+# set in Cloud Run before this deploys, or the first real settle will 401.
+_x402_facilitator = HTTPFacilitatorClient(_nexus_cdp_create_facilitator_config())
 _x402_server = x402ResourceServer(_x402_facilitator)
 _x402_server.register(_X402_NETWORK, ExactEvmServerScheme())
 
@@ -672,7 +694,7 @@ async def _nexus_traffic_log(request, call_next):
 
 class VerifyRegisteredAgentRequest(BaseModel):
     agent_id: Annotated[int, Field(..., ge=0, le=_MAX_AGENT_ID,
-        description="ERC-8004 IdentityRegistry token ID (agentId) on Base Sepolia testnet.")]
+        description="ERC-8004 IdentityRegistry token ID (agentId) on Base mainnet.")]
 
 
 class RegistrationInfo(BaseModel):
@@ -714,7 +736,7 @@ class VerifyRegisteredAgentResponse(BaseModel):
     },
 )
 async def verify_registered_agent_endpoint(payload: VerifyRegisteredAgentRequest) -> dict:
-    """Checks whether an ERC-8004-registered agent (Base Sepolia testnet) is
+    """Checks whether an ERC-8004-registered agent (Base mainnet) is
     actually alive right now.
 
     `verdict` meanings:
@@ -795,10 +817,10 @@ async def agent_card() -> dict:
         "metadata": {
             "protocol_note": (
                 "This service implements the Model Context Protocol (MCP) at /mcp, not A2A's own task "
-                f"methods. POST /verify-registered-agent is charged {_X402_PRICE} via x402 (Base Sepolia "
-                "TESTNET, not real funds); the MCP tool is currently free -- see README. Payment settles "
+                f"methods. POST /verify-registered-agent is charged {_X402_PRICE} via x402 (Base mainnet, "
+                "real USDC); the MCP tool is currently free -- see README. Payment settles "
                 "BEFORE this handler runs: a call is charged even on AGENT_NOT_FOUND or a 422. Checks the "
-                "real ERC-8004 Identity Registry on Base Sepolia testnet -- no exclusive data access, the "
+                "real ERC-8004 Identity Registry on Base mainnet -- no exclusive data access, the "
                 "value is the real-time MCP liveness check a raw registry lookup can't give you."
             ),
         },
@@ -829,3 +851,5 @@ def _nexus_openapi_with_payment_info():
 app.openapi = _nexus_openapi_with_payment_info
 
 app.mount("/mcp", mcp.streamable_http_app())
+
+# NEXUS_MAINNET_CUTOVER_APPLIED_erc8004_agent_liveness
