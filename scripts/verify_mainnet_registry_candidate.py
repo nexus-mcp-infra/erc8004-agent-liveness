@@ -282,6 +282,50 @@ def find_real_agent_ids_via_api(addr, label, from_block, latest_block):
     return found
 
 
+def find_real_agent_ids_via_blockscout(addr, label, from_block, latest_block):
+    """eth_getLogs equivalent via Blockscout's Base instance -- independent of
+    Etherscan/Basescan entirely, no API key, no plan tier. Uses Blockscout's
+    Etherscan-compatible legacy API (module=logs&action=getLogs), documented at
+    https://docs.blockscout.com/devs/apis/rpc-endpoints/logs -- exact endpoint:
+    https://base.blockscout.com/api?module=logs&action=getLogs. Same
+    timestamp-validated block range as the other attempts, not re-derived."""
+    url = (
+        "https://base.blockscout.com/api"
+        f"?module=logs&action=getLogs"
+        f"&fromBlock={from_block}&toBlock={latest_block}"
+        f"&address={addr}&topic0={TRANSFER_TOPIC}"
+    )
+    log(f"[blockscout] {label}: GET {url}")
+    try:
+        with urllib.request.urlopen(url, timeout=30) as resp:
+            data = json.loads(resp.read())
+    except urllib.error.URLError as e:
+        log(f"[blockscout] {label}: request failed: {e!r}")
+        return []
+
+    status = data.get("status")
+    result = data.get("result")
+    if status != "1" or not isinstance(result, list):
+        log(f"[blockscout] {label}: status={status!r} message={data.get('message')!r} result={result!r}")
+        return []
+
+    log(f"[blockscout] {label} ({addr}): {len(result)} Transfer-topic log(s) found via Blockscout, block {from_block}-{latest_block}")
+    found = []
+    for entry in result:
+        topics = entry.get("topics", [])
+        if len(topics) != 4 or not topics[3]:
+            continue
+        token_id = int(topics[3], 16)
+        owner = "0x" + topics[2][-40:]
+        frm = "0x" + topics[1][-40:]
+        tx_hash = entry.get("transactionHash")
+        raw_block = entry.get("blockNumber", "0x0")
+        block_num = int(raw_block, 16) if isinstance(raw_block, str) and raw_block.startswith("0x") else int(raw_block or 0)
+        log(f"[blockscout]   agentId={token_id} from={frm} to={owner} tx={tx_hash} block={block_num}")
+        found.append({"agentId": token_id, "owner": owner, "from": frm, "txHash": tx_hash, "blockNumber": block_num})
+    return found
+
+
 def try_reads(w3, label, addr, agent_ids):
     contract = w3.eth.contract(address=addr, abi=MINIMAL_ABI)
     for tid in agent_ids:
@@ -470,6 +514,14 @@ def main():
     found_current = find_real_agent_ids_via_api(CURRENT_ADDR, "CURRENT", verified_from_block, latest)
     time.sleep(0.5)
     found_candidate = find_real_agent_ids_via_api(CANDIDATE_ADDR, "CANDIDATE", verified_from_block, latest)
+
+    log("\n=== Step 4b: same query via Blockscout (independent of Etherscan, no key, no known paywall) ===")
+    found_current_bs = find_real_agent_ids_via_blockscout(CURRENT_ADDR, "CURRENT", verified_from_block, latest)
+    time.sleep(0.5)
+    found_candidate_bs = find_real_agent_ids_via_blockscout(CANDIDATE_ADDR, "CANDIDATE", verified_from_block, latest)
+    found_current = found_current + found_current_bs
+    found_candidate = found_candidate + found_candidate_bs
+
     found = found_current + found_candidate
     if found:
         agent_ids = sorted({f["agentId"] for f in found})[:8]
