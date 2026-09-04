@@ -126,13 +126,17 @@ def check_eip1967_impl(w3, label, addr):
         return None
 
 
-def check_basescan_source(addr, label):
+def _basescan_api_key():
     import os
 
-    api_key = os.environ.get("BASESCAN_API_KEY", "")
+    return os.environ.get("BASESCAN_API_KEY", "")
+
+
+def check_basescan_source(addr, label):
+    api_key = _basescan_api_key()
     if not api_key:
         log(f"[basescan] {label}: no BASESCAN_API_KEY secret set in this repo -- skipping source/ABI verification check")
-        return
+        return None
     url = (
         "https://api.etherscan.io/v2/api"
         f"?chainid=8453&module=contract&action=getsourcecode&address={addr}&apikey={api_key}"
@@ -144,11 +148,14 @@ def check_basescan_source(addr, label):
         if isinstance(result, list) and result:
             r0 = result[0]
             verified = bool(r0.get("SourceCode"))
-            log(f"[basescan] {label}: ContractName={r0.get('ContractName')!r} verified={verified} Proxy={r0.get('Proxy')} Implementation={r0.get('Implementation')!r}")
+            log(f"[basescan] {label} ({addr}): ContractName={r0.get('ContractName')!r} verified={verified} Proxy={r0.get('Proxy')} Implementation={r0.get('Implementation')!r} CompilerVersion={r0.get('CompilerVersion')!r}")
+            return r0
         else:
-            log(f"[basescan] {label}: unexpected response: {data}")
+            log(f"[basescan] {label} ({addr}): unexpected response: {data}")
+            return None
     except urllib.error.URLError as e:
-        log(f"[basescan] {label}: request failed: {e!r}")
+        log(f"[basescan] {label} ({addr}): request failed: {e!r}")
+        return None
 
 
 def get_block_with_retry(target, retries=6):
@@ -233,9 +240,7 @@ def try_reads(w3, label, addr, agent_ids):
 def fetch_txlist(addr, label):
     """Full real transaction history for `addr` on Base mainnet, straight from
     Basescan's indexed API -- no block range guessing, no pre-known hash needed."""
-    import os
-
-    api_key = os.environ.get("BASESCAN_API_KEY", "")
+    api_key = _basescan_api_key()
     if not api_key:
         log(f"[txlist] {label}: no BASESCAN_API_KEY secret set -- Basescan's v1 API (no key required) is deprecated as of this run (confirmed: returns status=0, 'deprecated V1 endpoint'), v2 requires a key. Skipping, relying on Step 4's timestamp-verified log scan instead.")
         return []
@@ -265,6 +270,58 @@ def fetch_txlist(addr, label):
     except urllib.error.URLError as e:
         log(f"[txlist] {label}: request failed: {e!r}")
         return []
+
+
+def fetch_receipt_via_api(tx_hash, retries=3):
+    """eth_getTransactionReceipt via the paid Etherscan v2 API (module=proxy)
+    instead of the free public RPC -- avoids the 429s that hit every run so
+    far. Returns the raw JSON-RPC receipt dict (hex fields) or None."""
+    api_key = _basescan_api_key()
+    if not api_key:
+        return None
+    url = (
+        "https://api.etherscan.io/v2/api"
+        f"?chainid=8453&module=proxy&action=eth_getTransactionReceipt&txhash={tx_hash}&apikey={api_key}"
+    )
+    for attempt in range(retries):
+        try:
+            with urllib.request.urlopen(url, timeout=20) as resp:
+                data = json.loads(resp.read())
+            result = data.get("result")
+            if result is None and "error" in data:
+                log(f"[api-receipt] {tx_hash}: {data['error']}")
+                return None
+            return result
+        except urllib.error.URLError as e:
+            log(f"[api-receipt] {tx_hash}: request failed (attempt {attempt+1}): {e!r}")
+            time.sleep(1.5 * (attempt + 1))
+    return None
+
+
+def decode_receipt_json(receipt, expected_to, tx_hash):
+    """Decode a raw JSON-RPC receipt (hex fields, as returned by the
+    Etherscan proxy API) -- confirms `to` and any Transfer-shaped log."""
+    if not receipt:
+        log(f"[receipt] {tx_hash}: no receipt returned via API")
+        return None
+    to_addr = receipt.get("to")
+    status = receipt.get("status")
+    log(f"[receipt] {tx_hash}: to={to_addr} status={status} (expected to={expected_to})")
+    if to_addr and to_addr.lower() != expected_to.lower():
+        log(f"[receipt]   WARNING: `to` does NOT match expected address!")
+    for entry in receipt.get("logs", []):
+        topics = entry.get("topics", [])
+        if not topics:
+            continue
+        t0 = topics[0]
+        if len(topics) == 4 and t0.lower() == TRANSFER_TOPIC.lower():
+            token_id = int(topics[3], 16)
+            owner = "0x" + topics[2][-40:]
+            frm = "0x" + topics[1][-40:]
+            log(f"[receipt]   Transfer log: from={frm} to={owner} agentId={token_id}")
+        else:
+            log(f"[receipt]   other log: address={entry.get('address')} topic0={t0}")
+    return receipt
 
 
 def decode_receipt(w3, tx_hash, expected_to, retries=5):
@@ -315,12 +372,16 @@ def main():
     candidate_len = check_bytecode(w3, "CANDIDATE (0x8004A169...)", CANDIDATE_ADDR)
 
     log("\n=== Step 2: EIP-1967 proxy implementation slot ===")
-    check_eip1967_impl(w3, "CURRENT", CURRENT_ADDR)
-    check_eip1967_impl(w3, "CANDIDATE", CANDIDATE_ADDR)
+    current_impl = check_eip1967_impl(w3, "CURRENT", CURRENT_ADDR)
+    candidate_impl = check_eip1967_impl(w3, "CANDIDATE", CANDIDATE_ADDR)
 
-    log("\n=== Step 3: Basescan source/ABI verification (best-effort) ===")
-    check_basescan_source(CURRENT_ADDR, "CURRENT")
-    check_basescan_source(CANDIDATE_ADDR, "CANDIDATE")
+    log("\n=== Step 3: Basescan/Etherscan v2 source/ABI verification (proxy + implementation) ===")
+    check_basescan_source(CURRENT_ADDR, "CURRENT proxy")
+    check_basescan_source(CANDIDATE_ADDR, "CANDIDATE proxy")
+    if current_impl:
+        check_basescan_source(current_impl, "CURRENT implementation")
+    if candidate_impl:
+        check_basescan_source(candidate_impl, "CANDIDATE implementation")
 
     log("\n=== Step 4a: validate the block-time assumption before trusting any range ===")
     import datetime
@@ -365,17 +426,29 @@ def main():
     time.sleep(1)
     candidate_txs = fetch_txlist(CANDIDATE_ADDR, "CANDIDATE")
 
+    has_key = bool(_basescan_api_key())
+
     successful_current = [t for t in current_txs if t.get("isError") == "0"]
     log(f"[txlist] CURRENT: {len(successful_current)} successful tx(s) out of {len(current_txs)} total")
     for tx in successful_current:
-        decode_receipt(w3, tx["hash"], CURRENT_ADDR)
-        time.sleep(0.5)
+        if has_key:
+            r = fetch_receipt_via_api(tx["hash"])
+            decode_receipt_json(r, CURRENT_ADDR, tx["hash"])
+            time.sleep(0.3)
+        else:
+            decode_receipt(w3, tx["hash"], CURRENT_ADDR)
+            time.sleep(0.5)
 
     successful_candidate = [t for t in candidate_txs if t.get("isError") == "0"]
     log(f"[txlist] CANDIDATE: {len(successful_candidate)} successful tx(s) out of {len(candidate_txs)} total")
     for tx in successful_candidate:
-        decode_receipt(w3, tx["hash"], CANDIDATE_ADDR)
-        time.sleep(0.5)
+        if has_key:
+            r = fetch_receipt_via_api(tx["hash"])
+            decode_receipt_json(r, CANDIDATE_ADDR, tx["hash"])
+            time.sleep(0.3)
+        else:
+            decode_receipt(w3, tx["hash"], CANDIDATE_ADDR)
+            time.sleep(0.5)
 
     log("\n=== DONE ===")
 
