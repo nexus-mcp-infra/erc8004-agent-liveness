@@ -282,20 +282,18 @@ def find_real_agent_ids_via_api(addr, label, from_block, latest_block):
     return found
 
 
-def find_real_agent_ids_via_blockscout(addr, label, from_block, latest_block):
-    """eth_getLogs equivalent via Blockscout's Base instance -- independent of
-    Etherscan/Basescan entirely, no API key, no plan tier. Uses Blockscout's
-    Etherscan-compatible legacy API (module=logs&action=getLogs), documented at
-    https://docs.blockscout.com/devs/apis/rpc-endpoints/logs -- exact endpoint:
-    https://base.blockscout.com/api?module=logs&action=getLogs. Same
-    timestamp-validated block range as the other attempts, not re-derived."""
+def _blockscout_fetch_chunk(addr, from_block, to_block, timeout=20):
+    """Single Blockscout getLogs call for one chunk. Returns (status, payload)
+    where status is 'ok' / 'http_error' / 'timeout' / 'other_error', and
+    payload is the decoded JSON (on 'ok') or a short description otherwise.
+    Never raises -- every failure mode is caught and classified explicitly,
+    per instruction, so a chunk failure never aborts the whole scan."""
     url = (
         "https://base.blockscout.com/api"
         f"?module=logs&action=getLogs"
-        f"&fromBlock={from_block}&toBlock={latest_block}"
+        f"&fromBlock={from_block}&toBlock={to_block}"
         f"&address={addr}&topic0={TRANSFER_TOPIC}"
     )
-    log(f"[blockscout] {label}: GET {url}")
     req = urllib.request.Request(
         url,
         headers={
@@ -304,40 +302,86 @@ def find_real_agent_ids_via_blockscout(addr, label, from_block, latest_block):
         },
     )
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            data = json.loads(resp.read())
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return "ok", json.loads(resp.read())
     except urllib.error.HTTPError as e:
         body = ""
         try:
-            body = e.read().decode("utf-8", errors="replace")[:500]
+            body = e.read().decode("utf-8", errors="replace")[:300]
         except Exception:
             pass
-        log(f"[blockscout] {label}: HTTP {e.code} {e.reason} -- body: {body!r}")
-        return []
+        return "http_error", f"HTTP {e.code} {e.reason} -- body: {body!r}"
+    except TimeoutError:
+        return "timeout", f"read timed out after {timeout}s"
     except urllib.error.URLError as e:
-        log(f"[blockscout] {label}: request failed: {e!r}")
-        return []
+        return "other_error", repr(e)
+    except OSError as e:
+        # covers ConnectionResetError, socket-level failures not wrapped by urllib
+        return "other_error", repr(e)
 
-    status = data.get("status")
-    result = data.get("result")
-    if status != "1" or not isinstance(result, list):
-        log(f"[blockscout] {label}: status={status!r} message={data.get('message')!r} result={result!r}")
-        return []
 
-    log(f"[blockscout] {label} ({addr}): {len(result)} Transfer-topic log(s) found via Blockscout, block {from_block}-{latest_block}")
+def find_real_agent_ids_via_blockscout(addr, label, from_block, latest_block, chunk_size=10_000):
+    """eth_getLogs equivalent via Blockscout's Base instance -- independent of
+    Etherscan/Basescan entirely, no API key, no plan tier. Uses Blockscout's
+    Etherscan-compatible legacy API (module=logs&action=getLogs), documented at
+    https://docs.blockscout.com/devs/apis/rpc-endpoints/logs -- exact endpoint:
+    https://base.blockscout.com/api?module=logs&action=getLogs.
+
+    Run 8 tried this over the full ~260,000-block range in one call and got a
+    real HTTP 500 from Blockscout's own backend on CURRENT, then an unhandled
+    TimeoutError on CANDIDATE that crashed the whole script (only HTTPError/
+    URLError were caught, not a bare TimeoutError). This version chunks the
+    already timestamp-validated range, catches both failure modes explicitly
+    (plus a generic OSError fallback), backs off between chunks -- longer
+    after an error -- and logs every chunk's outcome so a hang is visible
+    instead of silent."""
     found = []
-    for entry in result:
-        topics = entry.get("topics", [])
-        if len(topics) != 4 or not topics[3]:
-            continue
-        token_id = int(topics[3], 16)
-        owner = "0x" + topics[2][-40:]
-        frm = "0x" + topics[1][-40:]
-        tx_hash = entry.get("transactionHash")
-        raw_block = entry.get("blockNumber", "0x0")
-        block_num = int(raw_block, 16) if isinstance(raw_block, str) and raw_block.startswith("0x") else int(raw_block or 0)
-        log(f"[blockscout]   agentId={token_id} from={frm} to={owner} tx={tx_hash} block={block_num}")
-        found.append({"agentId": token_id, "owner": owner, "from": frm, "txHash": tx_hash, "blockNumber": block_num})
+    error_chunks = []
+    b = from_block
+    total_chunks = -(-(latest_block - from_block + 1) // chunk_size)  # ceil div
+    chunk_num = 0
+    while b <= latest_block:
+        end = min(b + chunk_size - 1, latest_block)
+        chunk_num += 1
+        status, payload = _blockscout_fetch_chunk(addr, b, end)
+
+        if status == "ok":
+            data = payload
+            result = data.get("result")
+            if data.get("status") == "1" and isinstance(result, list):
+                log(f"[blockscout] {label} chunk {chunk_num}/{total_chunks} [{b}-{end}]: OK, {len(result)} log(s)")
+                for entry in result:
+                    topics = entry.get("topics", [])
+                    if len(topics) != 4 or not topics[3]:
+                        continue
+                    token_id = int(topics[3], 16)
+                    owner = "0x" + topics[2][-40:]
+                    frm = "0x" + topics[1][-40:]
+                    tx_hash = entry.get("transactionHash")
+                    raw_block = entry.get("blockNumber", "0x0")
+                    block_num = int(raw_block, 16) if isinstance(raw_block, str) and raw_block.startswith("0x") else int(raw_block or 0)
+                    log(f"[blockscout]   agentId={token_id} from={frm} to={owner} tx={tx_hash} block={block_num}")
+                    found.append({"agentId": token_id, "owner": owner, "from": frm, "txHash": tx_hash, "blockNumber": block_num})
+            else:
+                # Blockscout returns status="0"/empty result for "no logs found" too --
+                # only treat as a real error if message isn't the standard empty-result one.
+                msg = data.get("message", "")
+                if isinstance(msg, str) and "no records found" in msg.lower():
+                    log(f"[blockscout] {label} chunk {chunk_num}/{total_chunks} [{b}-{end}]: OK, 0 logs (no records found)")
+                else:
+                    log(f"[blockscout] {label} chunk {chunk_num}/{total_chunks} [{b}-{end}]: unexpected payload status={data.get('status')!r} message={msg!r}")
+                    error_chunks.append((b, end, f"status={data.get('status')!r} message={msg!r}"))
+            time.sleep(0.5)
+        else:
+            log(f"[blockscout] {label} chunk {chunk_num}/{total_chunks} [{b}-{end}]: {status.upper()} -- {payload}")
+            error_chunks.append((b, end, f"{status}: {payload}"))
+            time.sleep(3.0)  # longer backoff after a real failure before the next chunk
+
+        b = end + 1
+
+    log(f"[blockscout] {label} ({addr}): scan done -- {len(found)} Transfer log(s), {len(error_chunks)}/{total_chunks} chunk(s) failed")
+    for eb, ee, reason in error_chunks:
+        log(f"[blockscout]   FAILED chunk [{eb}-{ee}]: {reason}")
     return found
 
 
