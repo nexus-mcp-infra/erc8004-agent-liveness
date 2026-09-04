@@ -337,13 +337,37 @@ def find_real_agent_ids_via_blockscout(addr, label, from_block, latest_block, ch
     instead of silent."""
     found = []
     error_chunks = []
-    b = from_block
     total_chunks = -(-(latest_block - from_block + 1) // chunk_size)  # ceil div
-    chunk_num = 0
+
+    # Scan newest-block-first, not oldest-first: today's real registrations
+    # sit right next to latest_block, and run 10 showed the rate limit
+    # exhausts partway through -- if that happens again, we want the chunks
+    # closest to "now" done BEFORE the budget runs out, not after.
+    chunk_bounds = []
+    b = from_block
     while b <= latest_block:
         end = min(b + chunk_size - 1, latest_block)
-        chunk_num += 1
+        chunk_bounds.append((b, end))
+        b = end + 1
+    chunk_bounds.reverse()
+
+    for position, (b, end) in enumerate(chunk_bounds, start=1):
+        chunk_num = len(chunk_bounds) - position + 1  # keep original left-to-right numbering in logs
         status, payload = _blockscout_fetch_chunk(addr, b, end)
+
+        # Run 10 (2026-09-04) found Blockscout's public rate limit kicks in
+        # hard after ~15 chunks and a flat 3s backoff never recovers within
+        # the run -- meaning the LAST chunks (closest to "now", i.e. exactly
+        # where today's real registrations would land) were the ones most
+        # likely to get permanently skipped. Retry 429s specifically with
+        # real backoff instead of moving on immediately.
+        retry = 0
+        while status == "http_error" and "429" in str(payload) and retry < 4:
+            retry += 1
+            wait = 10 * retry
+            log(f"[blockscout] {label} chunk {chunk_num} [{b}-{end}]: 429, retry {retry}/4 after {wait}s")
+            time.sleep(wait)
+            status, payload = _blockscout_fetch_chunk(addr, b, end)
 
         if status == "ok":
             data = payload
@@ -376,8 +400,6 @@ def find_real_agent_ids_via_blockscout(addr, label, from_block, latest_block, ch
             log(f"[blockscout] {label} chunk {chunk_num}/{total_chunks} [{b}-{end}]: {status.upper()} -- {payload}")
             error_chunks.append((b, end, f"{status}: {payload}"))
             time.sleep(3.0)  # longer backoff after a real failure before the next chunk
-
-        b = end + 1
 
     log(f"[blockscout] {label} ({addr}): scan done -- {len(found)} Transfer log(s), {len(error_chunks)}/{total_chunks} chunk(s) failed")
     for eb, ee, reason in error_chunks:
