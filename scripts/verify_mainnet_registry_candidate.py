@@ -151,8 +151,40 @@ def check_basescan_source(addr, label):
         log(f"[basescan] {label}: request failed: {e!r}")
 
 
-def find_real_agent_ids(w3, latest_block):
-    from_block = max(0, latest_block - 120_000)
+def get_block_with_retry(target, retries=6):
+    """eth_getBlockByNumber with retry/rotation across RPC endpoints -- the
+    120,000-block guess in the first two runs of this script was never
+    actually validated against real timestamps, so before trusting any log
+    scan again we confirm what calendar window a given block really is."""
+    last_err = None
+    for attempt in range(retries):
+        for url in RPC_CANDIDATES:
+            try:
+                w3_try = Web3(Web3.HTTPProvider(url, request_kwargs={"timeout": 20}))
+                return w3_try.eth.get_block(target)
+            except Exception as e:
+                last_err = e
+                if "429" in str(e) or "Too Many Requests" in str(e):
+                    time.sleep(1.5 * (attempt + 1))
+                    continue
+        time.sleep(1.5 * (attempt + 1))
+    raise SystemExit(f"[blocktime] could not fetch block {target} after {retries} rounds: {last_err!r}")
+
+
+def find_block_by_timestamp(target_ts, lo, hi):
+    """Binary search for the first block with timestamp >= target_ts."""
+    while lo < hi:
+        mid = (lo + hi) // 2
+        blk = get_block_with_retry(mid)
+        if blk["timestamp"] < target_ts:
+            lo = mid + 1
+        else:
+            hi = mid
+        time.sleep(0.3)
+    return lo
+
+
+def find_real_agent_ids(w3, from_block, latest_block):
     chunk = 10_000
     found = []
     all_topic0 = set()
@@ -203,10 +235,13 @@ def fetch_txlist(addr, label):
     Basescan's indexed API -- no block range guessing, no pre-known hash needed."""
     import os
 
-    api_key = os.environ.get("BASESCAN_API_KEY", "YourApiKeyToken")
+    api_key = os.environ.get("BASESCAN_API_KEY", "")
+    if not api_key:
+        log(f"[txlist] {label}: no BASESCAN_API_KEY secret set -- Basescan's v1 API (no key required) is deprecated as of this run (confirmed: returns status=0, 'deprecated V1 endpoint'), v2 requires a key. Skipping, relying on Step 4's timestamp-verified log scan instead.")
+        return []
     url = (
-        "https://api.basescan.org/api"
-        f"?module=account&action=txlist&address={addr}"
+        "https://api.etherscan.io/v2/api"
+        f"?chainid=8453&module=account&action=txlist&address={addr}"
         "&startblock=0&endblock=99999999&sort=asc"
         f"&apikey={api_key}"
     )
@@ -287,8 +322,27 @@ def main():
     check_basescan_source(CURRENT_ADDR, "CURRENT")
     check_basescan_source(CANDIDATE_ADDR, "CANDIDATE")
 
-    log("\n=== Step 4: real agentIds from register() event logs (CURRENT address, mainnet) ===")
-    found = find_real_agent_ids(w3, latest)
+    log("\n=== Step 4a: validate the block-time assumption before trusting any range ===")
+    import datetime
+
+    latest_block_obj = get_block_with_retry(latest)
+    latest_ts = latest_block_obj["timestamp"]
+    probe_block = max(0, latest - 120_000)
+    probe_block_obj = get_block_with_retry(probe_block)
+    probe_ts = probe_block_obj["timestamp"]
+    elapsed_s = latest_ts - probe_ts
+    log(f"[blocktime] latest block {latest} @ {datetime.datetime.utcfromtimestamp(latest_ts).isoformat()}Z")
+    log(f"[blocktime] block {probe_block} (latest-120000) @ {datetime.datetime.utcfromtimestamp(probe_ts).isoformat()}Z")
+    log(f"[blocktime] 120,000 blocks = {elapsed_s} real seconds = {elapsed_s / 3600:.1f} hours (assumed 2s/block would be {120_000 * 2 / 3600:.1f} hours)")
+    log(f"[blocktime] PREVIOUS TWO RUNS scanned this exact 120,000-block window -- if the hours figure above is much smaller than expected, that scan covered far less real time than intended")
+
+    target_ts = latest_ts - 6 * 24 * 3600  # 6 days back, safe margin over the 2026-09-03 cutover
+    verified_from_block = find_block_by_timestamp(target_ts, max(0, latest - 20_000_000), latest)
+    verified_from_ts = get_block_with_retry(verified_from_block)["timestamp"]
+    log(f"[blocktime] timestamp-verified from_block={verified_from_block} @ {datetime.datetime.utcfromtimestamp(verified_from_ts).isoformat()}Z (target: 6 days before latest)")
+
+    log("\n=== Step 4: real agentIds from register() event logs (CURRENT address, mainnet, timestamp-verified range) ===")
+    found = find_real_agent_ids(w3, verified_from_block, latest)
     if found:
         agent_ids = sorted({f["agentId"] for f in found})[:8]
         log(f"[logs] using REAL agentIds extracted from logs for read test: {agent_ids}")
