@@ -80,6 +80,13 @@ MINIMAL_ABI = [
         "stateMutability": "view",
         "type": "function",
     },
+    {
+        "name": "totalSupply",
+        "inputs": [],
+        "outputs": [{"name": "", "type": "uint256"}],
+        "stateMutability": "view",
+        "type": "function",
+    },
 ]
 
 TRANSFER_TOPIC = Web3.keccak(text="Transfer(address,address,uint256)").hex()
@@ -235,6 +242,11 @@ def try_reads(w3, label, addr, agent_ids):
             log(f"[read] {label}.ownerOf({tid}) = {owner}")
         except Exception as e:
             log(f"[read] {label}.ownerOf({tid}) REVERTED: {e!r}")
+    try:
+        supply = contract.functions.totalSupply().call()
+        log(f"[read] {label}.totalSupply() = {supply}")
+    except Exception as e:
+        log(f"[read] {label}.totalSupply() REVERTED/unsupported: {e!r}")
 
 
 def fetch_txlist(addr, label):
@@ -377,11 +389,15 @@ def main():
 
     log("\n=== Step 3: Basescan/Etherscan v2 source/ABI verification (proxy + implementation) ===")
     check_basescan_source(CURRENT_ADDR, "CURRENT proxy")
+    time.sleep(1.0)
     check_basescan_source(CANDIDATE_ADDR, "CANDIDATE proxy")
+    time.sleep(1.0)
     if current_impl:
         check_basescan_source(current_impl, "CURRENT implementation")
+        time.sleep(1.0)
     if candidate_impl:
         check_basescan_source(candidate_impl, "CANDIDATE implementation")
+        time.sleep(1.0)
 
     log("\n=== Step 4a: validate the block-time assumption before trusting any range ===")
     import datetime
