@@ -296,9 +296,24 @@ def find_real_agent_ids_via_blockscout(addr, label, from_block, latest_block):
         f"&address={addr}&topic0={TRANSFER_TOPIC}"
     )
     log(f"[blockscout] {label}: GET {url}")
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+            "Accept": "application/json",
+        },
+    )
     try:
-        with urllib.request.urlopen(url, timeout=30) as resp:
+        with urllib.request.urlopen(req, timeout=30) as resp:
             data = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode("utf-8", errors="replace")[:500]
+        except Exception:
+            pass
+        log(f"[blockscout] {label}: HTTP {e.code} {e.reason} -- body: {body!r}")
+        return []
     except urllib.error.URLError as e:
         log(f"[blockscout] {label}: request failed: {e!r}")
         return []
