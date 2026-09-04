@@ -64,13 +64,29 @@ this asset exists to prevent for its *buyers*: a plausible-looking wrong
 answer (`AGENT_NOT_FOUND` for a real agent) charged for as if it were
 right.
 
-Net result, current state: **x402 payment is real USDC on Base mainnet;
-the identity/liveness check itself still reads Base Sepolia testnet.**
-This is a deliberate, disclosed interim tradeoff, not an oversight -- see
-`_BASE_RPC` below and the buyer-facing text on `/verify-registered-agent`
-and the agent-card, which both say this explicitly. Revisit only after the
-mainnet implementation's real bytecode/ABI is confirmed (decompile, or the
-ERC-8004 team) -- see README "Pending".
+# --- PATCH erc8004_mainnet_registry_cutover: _NEXUS_ERC8004_MAINNET_REGISTRY_CUTOVER ---
+**Mainnet registry corrected (2026-09-04)**: the 2026-09-03 partial revert
+above was investigating the wrong contract. `0x8004A818...` is itself the
+deterministic Base SEPOLIA IdentityRegistry address from
+`erc-8004/erc-8004-contracts`'s vanity-address deployment pattern -- it was
+never the real Base mainnet deployment, which is a *different*
+deterministic address per network. The real Base mainnet IdentityRegistry
+is `0x8004A169FB4a3325136EB29fA0ceB6D2e539a432`: its implementation
+(`0x7274e874ca62410a93bd8bf61c69d8045e399c02`) is verified on Etherscan as
+`IdentityRegistryUpgradeable` (exact name match with the reference repo,
+compiler v0.8.24+commit.e11b9ed9), `ownerOf` reads succeed against it, and
+a Basescan export shows 25 real Base mainnet transactions against it
+(2026-09-04 09:02-10:06 UTC, 25/25 successful: 5x `register`, 20x
+`setMetadata`). Full verification trail:
+scripts/verify_mainnet_registry_candidate.py, branch
+claude/erc8004-registry-address-verify-u2db8u. NOT re-verified this
+session: `_REPUTATION_REGISTRY_ADDRESS`'s real mainnet counterpart -- see
+the config block below.
+
+Net result, current state: **both x402 payment and the identity/liveness
+registry read are real Base mainnet**, against the verified
+`IdentityRegistryUpgradeable` implementation. See `_BASE_RPC` /
+`_IDENTITY_REGISTRY_ADDRESS` below.
 """
 
 import asyncio
@@ -113,21 +129,48 @@ from cdp.x402 import create_facilitator_config as _nexus_cdp_create_facilitator_
 _NEXUS_ASSET_NAME = "erc8004-agent-liveness"
 
 # ---------------------------------------------------------------
-# ERC-8004 registry config -- Base SEPOLIA TESTNET (deliberately NOT Base
-# mainnet, as of the 2026-09-03 partial revert -- see module docstring).
-# The mainnet proxy's implementation has no verified source/ABI anywhere,
-# and ownerOf/balanceOf both revert against it in real testing -- reading
-# testnet here, where the bytecode IS verified against
-# github.com/erc-8004/erc-8004-contracts (commit b9e466c) and confirmed
-# working live, is safer than trusting unverified mainnet bytecode by
-# function name alone. x402 PAYMENT still settles on Base mainnet in real
-# USDC (see the x402 config further down) -- only this registry read is on
-# testnet. Revisit once the mainnet implementation's real ABI is confirmed
-# (see README "Pending").
+# ERC-8004 registry config -- Base MAINNET (2026-09-04 correction, see
+# module docstring "Mainnet registry corrected"). 0x8004A818... (the OLD
+# constant here) turned out to be the deterministic Base SEPOLIA address,
+# not a broken mainnet deployment. Real Base mainnet IdentityRegistry:
+# 0x8004A169FB4a3325136EB29fA0ceB6D2e539a432, verified implementation
+# (IdentityRegistryUpgradeable), 25/25 successful real mainnet
+# transactions confirmed via Basescan export 2026-09-04.
+#
+# NOT VERIFIED THIS SESSION: ReputationRegistry's real mainnet address.
+# _REPUTATION_REGISTRY_ADDRESS below is UNCHANGED (still the Sepolia
+# deterministic address) -- flagged, not guessed. Reputation reads below
+# may be against the wrong network's contract until this is verified
+# separately.
+#
+# TECH DEBT, flagged 2026-09-04: BASE_RPC_URL below is the free public
+# https://mainnet.base.org -- no SLA. CDP's SDK (already a pinned
+# dependency here, requirements.txt) does ship a "Base Node" RPC endpoint
+# that reuses the SAME CDP_API_KEY_ID/CDP_API_KEY_SECRET already
+# configured for the x402 facilitator: see
+# cdp.base_node_rpc_url.get_base_node_rpc_url(api_clients, "base") in the
+# cdp-sdk source (verified by downloading the actual wheel from PyPI and
+# reading it -- docs.cdp.coinbase.com wasn't reachable to confirm this any
+# other way). It fetches an active-token id from
+# `{base_path}/apikeys/v1/tokens/active` at runtime and returns
+# `{base_path}/rpc/v1/base/{token_id}` -- NOT a static URL that can be
+# hardcoded as an env var default. Two things block wiring it in now: (1)
+# plan-tier availability can't be confirmed without a live call using the
+# real Cloud Run CDP credentials, which aren't available outside that
+# environment, and the function silently returns None on any failure,
+# masking a plan rejection as identical to a transient error; (2) _BASE_RPC
+# is resolved synchronously at module import time today (see _w3 below),
+# while get_base_node_rpc_url is async and needs an async-initialized CDP
+# client -- real integration means restructuring Web3 client construction
+# to happen at async startup with timeout/fallback handling, not a
+# constant swap, and a mistake there risks the container failing to start
+# rather than just a bad RPC URL. Deferred until there's a concrete reason
+# (rate limits, cost, or reliability issues on the public endpoint) that
+# justifies that structural change.
 # ---------------------------------------------------------------
-_BASE_RPC = os.getenv("BASE_SEPOLIA_RPC_URL", "https://sepolia.base.org")
-_IDENTITY_REGISTRY_ADDRESS = "0x8004A818BFB912233c491871b3d84c89A494BD9e"
-_REPUTATION_REGISTRY_ADDRESS = "0x8004B663056A597Dffe9eCcC1965A193B7388713"
+_BASE_RPC = os.getenv("BASE_RPC_URL", "https://mainnet.base.org")
+_IDENTITY_REGISTRY_ADDRESS = "0x8004A169FB4a3325136EB29fA0ceB6D2e539a432"
+_REPUTATION_REGISTRY_ADDRESS = "0x8004B663056A597Dffe9eCcC1965A193B7388713"  # NOT re-verified on mainnet -- see comment above
 
 _IDENTITY_ABI = [
     {"inputs": [{"internalType": "uint256", "name": "tokenId", "type": "uint256"}],
@@ -534,8 +577,8 @@ def _validate_agent_id(agent_id: int) -> int:
 @mcp.tool()
 async def verify_registered_agent(agent_id: int, ctx: Context = None) -> dict:
     """Checks whether an agent registered in the real ERC-8004 Identity
-    Registry (Base Sepolia testnet -- see module docstring "Registry-read
-    partial revert" for why) is actually alive right now: resolves
+    Registry (Base mainnet -- see module docstring "Mainnet registry
+    corrected" for the verification trail) is actually alive right now: resolves
     its on-chain registration file, then performs a real MCP `initialize`
     handshake against whatever endpoint it declares. verdict is one of
     AGENT_NOT_FOUND, REGISTRATION_FETCH_FAILED, REGISTERED_INACTIVE,
@@ -566,10 +609,10 @@ app = FastAPI(
     title="ERC-8004 Agent Liveness",
     description=(
         "Checks whether an agent registered in the real ERC-8004 Identity Registry (Base "
-        "Sepolia testnet) is actually alive right now -- resolves its on-chain registration file and performs "
+        "mainnet) is actually alive right now -- resolves its on-chain registration file and performs "
         "a real MCP handshake against its declared endpoint, not just a cached registration check. "
-        "Payment for this check settles in real USDC on Base mainnet even though the registry read "
-        "itself is on testnet -- see /verify-registered-agent's own description for why."
+        "Payment for this check and the registry read both resolve on Base mainnet -- "
+        "see /verify-registered-agent's own description for the verification trail."
     ),
     version="1.0.0",
     contact={"email": "dasaanrod@gmail.com"},
@@ -721,8 +764,8 @@ async def _nexus_traffic_log(request, call_next):
 
 class VerifyRegisteredAgentRequest(BaseModel):
     agent_id: Annotated[int, Field(..., ge=0, le=_MAX_AGENT_ID,
-        description="ERC-8004 IdentityRegistry token ID (agentId) on Base Sepolia testnet "
-                    "(the registry read is on testnet even though payment is real USDC on Base mainnet -- "
+        description="ERC-8004 IdentityRegistry token ID (agentId) on Base mainnet "
+                    "(the real IdentityRegistryUpgradeable deployment, verified 2026-09-04 -- "
                     "see this endpoint's own docstring).")]
 
 
@@ -767,12 +810,10 @@ class VerifyRegisteredAgentResponse(BaseModel):
 async def verify_registered_agent_endpoint(payload: VerifyRegisteredAgentRequest) -> dict:
     """Checks whether an ERC-8004-registered agent is actually alive right
     now. The registry read (this endpoint's actual identity check) is
-    against Base Sepolia testnet, not mainnet -- the mainnet proxy's
-    implementation has no verified source/ABI anywhere and real reads
-    against it revert, so this deliberately reads the registry whose
-    bytecode IS verified working. Payment is still real USDC on Base
-    mainnet regardless (see below) -- this is a disclosed interim
-    tradeoff, not a bug.
+    against Base mainnet's real IdentityRegistryUpgradeable deployment
+    (0x8004A169..., verified on Etherscan 2026-09-04 -- see module
+    docstring "Mainnet registry corrected"). Payment also settles in real
+    USDC on Base mainnet.
 
     `verdict` meanings:
     - AGENT_NOT_FOUND: no agent is registered with this agent_id (ownerOf reverted).
@@ -855,9 +896,8 @@ async def agent_card() -> dict:
                 f"methods. POST /verify-registered-agent is charged {_X402_PRICE} via x402 (Base mainnet, "
                 "real USDC); the MCP tool is currently free -- see README. Payment settles "
                 "BEFORE this handler runs: a call is charged even on AGENT_NOT_FOUND or a 422. Checks the "
-                "real ERC-8004 Identity Registry on Base SEPOLIA TESTNET, not mainnet (payment is still real "
-                "mainnet USDC regardless -- the mainnet registry's implementation has no verified ABI and "
-                "real reads against it revert, see README) -- no exclusive data access, the "
+                "real ERC-8004 Identity Registry on Base MAINNET (verified IdentityRegistryUpgradeable "
+                "deployment, confirmed 2026-09-04 -- see README) -- no exclusive data access, the "
                 "value is the real-time MCP liveness check a raw registry lookup can't give you."
             ),
         },
@@ -890,3 +930,4 @@ app.openapi = _nexus_openapi_with_payment_info
 app.mount("/mcp", mcp.streamable_http_app())
 
 # NEXUS_MAINNET_CUTOVER_APPLIED_erc8004_agent_liveness
+# _NEXUS_ERC8004_CDP_NODE_RPC_RESEARCH_NOTE
