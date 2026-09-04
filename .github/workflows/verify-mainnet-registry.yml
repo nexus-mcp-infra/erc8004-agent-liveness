@@ -9,6 +9,16 @@ name: Verify mainnet registry candidate address
 # to any blockchain RPC or explorer.
 on:
   workflow_dispatch: {}
+  # workflow_dispatch alone won't register until this file is on the
+  # default branch. Trigger on push to this verification branch instead,
+  # scoped to the files this check actually needs, so it fires from CI
+  # (real internet access) without requiring a merge to main.
+  push:
+    branches:
+      - claude/erc8004-registry-address-verify-u2db8u
+    paths:
+      - scripts/verify_mainnet_registry_candidate.py
+      - .github/workflows/verify-mainnet-registry.yml
 
 jobs:
   verify:
