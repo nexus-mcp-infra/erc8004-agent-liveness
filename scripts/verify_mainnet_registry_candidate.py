@@ -600,50 +600,36 @@ def main():
     else:
         try_reads(w3, "CURRENT", CURRENT_ADDR, agent_ids)
 
-    log("\n=== Step 6: real receipts for any tx hashes found via step 4's log scan ===")
-    log("[txlist] account-module txlist confirmed paywalled on this Etherscan plan for Base (run 4: "
-        "'Free API access is not supported for this chain') -- not retrying it per instruction. "
-        "Using the real tx hashes decoded from step 4's Transfer logs instead.")
-    for f in found_current:
-        r = fetch_receipt_via_api(f["txHash"])
-        decode_receipt_json(r, CURRENT_ADDR, f["txHash"])
-        time.sleep(0.3)
-    for f in found_candidate:
-        r = fetch_receipt_via_api(f["txHash"])
-        decode_receipt_json(r, CANDIDATE_ADDR, f["txHash"])
-        time.sleep(0.3)
-    if not found_current and not found_candidate:
-        log("[txlist] no Transfer logs found on either address in step 4 -- nothing to fetch receipts for")
+    log("\n=== Step 6: SKIPPED -- redundant now that step 4b's Blockscout scan decoded real Transfer logs directly ===")
+    log(f"[txlist] step 4b already found {len(found_current)} real Transfer log(s) on CURRENT and "
+        f"{len(found_candidate)} on CANDIDATE with real tx hashes, owners, and agentIds decoded directly "
+        f"from the logs -- no need to also fetch receipts via the paywalled Etherscan account/proxy modules.")
 
     log("\n=== Step 7: post-deploy -- find REAL agentIds owned by today's 5 register() wallets ===")
-    log("[postdeploy] Known agentIds 1/2/3 already confirmed (testnet-era grounding, owners "
-        "0x89E9E1ab..., 0x6F0FaBeB..., 0x67722c82... -- none match the wallets below). "
-        "Today's 5 register() txs are newer, so probing sequential ids starting at 4.")
+    log("[postdeploy] Real registry has ~84,000+ existing agentIds (confirmed live, step 4b found entries up "
+        "to agentId 84043) -- this is a large, actively-used public registry, NOT just our own 5 registrations. "
+        "Searching step 4b's already-decoded 667 real Transfer logs on CANDIDATE for entries matching the 4 "
+        "target wallets, picking the HIGHEST block number per wallet (today's registration, since these "
+        "wallets may have registered other agents on prior days too).")
     target_wallets = [
         "0xE75EA91B",
         "0x0567DEB1",
         "0x955A2A4c",
         "0x3C0820e2",
     ]
-    contract = w3.eth.contract(address=CANDIDATE_ADDR, abi=MINIMAL_ABI)
     real_agent_ids = {}
-    for tid in range(1, 31):
-        try:
-            owner = contract.functions.ownerOf(tid).call()
-        except Exception as e:
-            log(f"[postdeploy] CANDIDATE.ownerOf({tid}) REVERTED/unsupported: {e!r}")
+    for w_target in target_wallets:
+        matches = [f for f in found_candidate if f["owner"].lower().startswith(w_target.lower())]
+        if not matches:
+            log(f"[postdeploy] {w_target}: no match in the {len(found_candidate)} decoded logs (scan may not cover this wallet's tx block -- see step 4a's range)")
             continue
-        match = next((w for w in target_wallets if owner.lower().startswith(w.lower())), None)
-        if match:
-            log(f"[postdeploy] agentId={tid} owner={owner} -- MATCHES target wallet prefix {match}")
-            real_agent_ids[match] = tid
-        else:
-            log(f"[postdeploy] agentId={tid} owner={owner} (no match)")
-        time.sleep(0.3)
+        best = max(matches, key=lambda f: f["blockNumber"])
+        log(f"[postdeploy] {w_target}: {len(matches)} historical match(es), most recent -> agentId={best['agentId']} block={best['blockNumber']} tx={best['txHash']}")
+        real_agent_ids[w_target] = best["agentId"]
     log(f"[postdeploy] real agentIds found for target wallets: {real_agent_ids}")
     if len(real_agent_ids) < len(target_wallets):
         missing = [w for w in target_wallets if w not in real_agent_ids]
-        log(f"[postdeploy] WARNING: {len(missing)}/{len(target_wallets)} target wallet(s) not found in ids 1-30: {missing}")
+        log(f"[postdeploy] WARNING: {len(missing)}/{len(target_wallets)} target wallet(s) not found in the decoded logs: {missing}")
 
     log("\n=== Step 8: live Cloud Run endpoint -- real POST against a real agentId ===")
     if real_agent_ids:
