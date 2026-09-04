@@ -30,10 +30,24 @@ Evidence produced, in order:
   5. ownerOf(agentId) / balanceOf(...) read calls against BOTH addresses,
      using the real agentIds found in step 4 (or, only if step 4 finds
      nothing, a clearly-labeled fallback probe of small sequential ids).
+  6. Follow-up (2026-09-04): step 4's block-range log scan came back empty
+     and is not trustworthy (the public RPC used started 429-rate-limiting
+     within the same run, and the scan assumed a block-time-derived range
+     that was never independently confirmed). No tx hash for the "19 real
+     confirmed register() transactions" (README.md:74) exists anywhere in
+     this repo, in NEXUS's Supabase (asset_registry, nexus_events -- both
+     checked, no match), or in any committed script -- so this step finds
+     them the reliable way: pull the FULL real transaction history for both
+     CURRENT_ADDR and CANDIDATE_ADDR directly from Basescan's address-indexed
+     API (no pre-known hash or block range needed), then, for every
+     successful tx found, fetch its REAL receipt over RPC and decode
+     whatever logs it actually emitted. This is receipt-level ground truth,
+     not a derived/assumed range scan.
 """
 
 import json
 import sys
+import time
 import urllib.request
 import urllib.error
 
@@ -184,6 +198,78 @@ def try_reads(w3, label, addr, agent_ids):
             log(f"[read] {label}.ownerOf({tid}) REVERTED: {e!r}")
 
 
+def fetch_txlist(addr, label):
+    """Full real transaction history for `addr` on Base mainnet, straight from
+    Basescan's indexed API -- no block range guessing, no pre-known hash needed."""
+    import os
+
+    api_key = os.environ.get("BASESCAN_API_KEY", "YourApiKeyToken")
+    url = (
+        "https://api.basescan.org/api"
+        f"?module=account&action=txlist&address={addr}"
+        "&startblock=0&endblock=99999999&sort=asc"
+        f"&apikey={api_key}"
+    )
+    try:
+        with urllib.request.urlopen(url, timeout=30) as resp:
+            data = json.loads(resp.read())
+        if data.get("status") != "1":
+            log(f"[txlist] {label} ({addr}): Basescan returned status={data.get('status')!r} message={data.get('message')!r} result={data.get('result')!r}")
+            return []
+        txs = data.get("result", [])
+        log(f"[txlist] {label} ({addr}): {len(txs)} real transactions found via Basescan")
+        for tx in txs:
+            method_id = (tx.get("input") or "0x")[:10]
+            log(
+                f"[txlist]   hash={tx.get('hash')} from={tx.get('from')} "
+                f"methodId={method_id} functionName={tx.get('functionName')!r} "
+                f"isError={tx.get('isError')} block={tx.get('blockNumber')} "
+                f"timeStamp={tx.get('timeStamp')}"
+            )
+        return txs
+    except urllib.error.URLError as e:
+        log(f"[txlist] {label}: request failed: {e!r}")
+        return []
+
+
+def decode_receipt(w3, tx_hash, expected_to, retries=5):
+    """Fetch the REAL receipt for tx_hash, retrying across RPC endpoints on
+    429s, and decode any Transfer-shaped mint logs it actually emitted."""
+    last_err = None
+    for attempt in range(retries):
+        for url in RPC_CANDIDATES:
+            try:
+                w3_try = Web3(Web3.HTTPProvider(url, request_kwargs={"timeout": 20}))
+                receipt = w3_try.eth.get_transaction_receipt(tx_hash)
+                to_addr = receipt["to"]
+                status = receipt["status"]
+                log(f"[receipt] {tx_hash}: to={to_addr} status={status} (expected to={expected_to})")
+                if to_addr and to_addr.lower() != expected_to.lower():
+                    log(f"[receipt]   WARNING: `to` does NOT match expected address!")
+                for entry in receipt["logs"]:
+                    topics = entry["topics"]
+                    if not topics:
+                        continue
+                    t0 = topics[0].hex()
+                    if len(topics) == 4 and t0 == TRANSFER_TOPIC:
+                        token_id = int(topics[3].hex(), 16)
+                        owner = "0x" + topics[2].hex()[-40:]
+                        frm = "0x" + topics[1].hex()[-40:]
+                        log(f"[receipt]   Transfer log: from={frm} to={owner} agentId={token_id}")
+                    else:
+                        log(f"[receipt]   other log: address={entry['address']} topic0={t0}")
+                return receipt
+            except Exception as e:
+                last_err = e
+                if "429" in str(e) or "Too Many Requests" in str(e):
+                    time.sleep(2 * (attempt + 1))
+                    continue
+                log(f"[receipt] {tx_hash} via {url} failed: {e!r}")
+        time.sleep(2 * (attempt + 1))
+    log(f"[receipt] {tx_hash}: giving up after {retries} rounds, last error: {last_err!r}")
+    return None
+
+
 def main():
     w3, rpc_url = connect()
     latest = w3.eth.block_number
@@ -219,6 +305,23 @@ def main():
         log("[read] CURRENT has no bytecode on this chain -- skipping read calls against it")
     else:
         try_reads(w3, "CURRENT", CURRENT_ADDR, agent_ids)
+
+    log("\n=== Step 6: real tx history + real receipts (Basescan-indexed, no assumed range) ===")
+    current_txs = fetch_txlist(CURRENT_ADDR, "CURRENT")
+    time.sleep(1)
+    candidate_txs = fetch_txlist(CANDIDATE_ADDR, "CANDIDATE")
+
+    successful_current = [t for t in current_txs if t.get("isError") == "0"]
+    log(f"[txlist] CURRENT: {len(successful_current)} successful tx(s) out of {len(current_txs)} total")
+    for tx in successful_current:
+        decode_receipt(w3, tx["hash"], CURRENT_ADDR)
+        time.sleep(0.5)
+
+    successful_candidate = [t for t in candidate_txs if t.get("isError") == "0"]
+    log(f"[txlist] CANDIDATE: {len(successful_candidate)} successful tx(s) out of {len(candidate_txs)} total")
+    for tx in successful_candidate:
+        decode_receipt(w3, tx["hash"], CANDIDATE_ADDR)
+        time.sleep(0.5)
 
     log("\n=== DONE ===")
 
