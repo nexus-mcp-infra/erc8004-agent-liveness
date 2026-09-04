@@ -30,8 +30,8 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install pinned web3
-        run: pip install web3==7.16.0
+      - name: Install pinned web3 + mcp (for the post-deploy live MCP tool check)
+        run: pip install web3==7.16.0 mcp==1.28.1
 
       - name: Run verification script
         env:

@@ -615,6 +615,98 @@ def main():
     if not found_current and not found_candidate:
         log("[txlist] no Transfer logs found on either address in step 4 -- nothing to fetch receipts for")
 
+    log("\n=== Step 7: post-deploy -- find REAL agentIds owned by today's 5 register() wallets ===")
+    log("[postdeploy] Known agentIds 1/2/3 already confirmed (testnet-era grounding, owners "
+        "0x89E9E1ab..., 0x6F0FaBeB..., 0x67722c82... -- none match the wallets below). "
+        "Today's 5 register() txs are newer, so probing sequential ids starting at 4.")
+    target_wallets = [
+        "0xE75EA91B",
+        "0x0567DEB1",
+        "0x955A2A4c",
+        "0x3C0820e2",
+    ]
+    contract = w3.eth.contract(address=CANDIDATE_ADDR, abi=MINIMAL_ABI)
+    real_agent_ids = {}
+    for tid in range(1, 31):
+        try:
+            owner = contract.functions.ownerOf(tid).call()
+        except Exception as e:
+            log(f"[postdeploy] CANDIDATE.ownerOf({tid}) REVERTED/unsupported: {e!r}")
+            continue
+        match = next((w for w in target_wallets if owner.lower().startswith(w.lower())), None)
+        if match:
+            log(f"[postdeploy] agentId={tid} owner={owner} -- MATCHES target wallet prefix {match}")
+            real_agent_ids[match] = tid
+        else:
+            log(f"[postdeploy] agentId={tid} owner={owner} (no match)")
+        time.sleep(0.3)
+    log(f"[postdeploy] real agentIds found for target wallets: {real_agent_ids}")
+    if len(real_agent_ids) < len(target_wallets):
+        missing = [w for w in target_wallets if w not in real_agent_ids]
+        log(f"[postdeploy] WARNING: {len(missing)}/{len(target_wallets)} target wallet(s) not found in ids 1-30: {missing}")
+
+    log("\n=== Step 8: live Cloud Run endpoint -- real POST against a real agentId ===")
+    if real_agent_ids:
+        test_agent_id = sorted(real_agent_ids.values())[0]
+        cloud_run_url = "https://erc8004-agent-liveness-325572559480.us-central1.run.app/health"
+        try:
+            req = urllib.request.Request(cloud_run_url, headers={"Accept": "application/json"})
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                log(f"[postdeploy] GET /health -> HTTP {resp.status}: {resp.read().decode('utf-8', errors='replace')[:300]}")
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="replace")[:300]
+            log(f"[postdeploy] GET /health -> HTTP {e.code} {e.reason}: {body}")
+        except Exception as e:
+            log(f"[postdeploy] GET /health failed: {e!r}")
+
+        agent_card_url = "https://erc8004-agent-liveness-325572559480.us-central1.run.app/.well-known/agent-card.json"
+        try:
+            req = urllib.request.Request(agent_card_url, headers={"Accept": "application/json"})
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                card = json.loads(resp.read())
+                log(f"[postdeploy] GET /.well-known/agent-card.json -> HTTP {resp.status}, protocol_note: {card.get('metadata', {}).get('protocol_note', '(not found)')[:400]}")
+        except Exception as e:
+            log(f"[postdeploy] GET agent-card failed: {e!r}")
+
+        verify_url = "https://erc8004-agent-liveness-325572559480.us-central1.run.app/verify-registered-agent"
+        payload = json.dumps({"agent_id": test_agent_id}).encode("utf-8")
+        req = urllib.request.Request(
+            verify_url, data=payload, method="POST",
+            headers={"Content-Type": "application/json", "Accept": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                body = resp.read().decode("utf-8", errors="replace")
+                log(f"[postdeploy] POST /verify-registered-agent {{agent_id: {test_agent_id}}} -> HTTP {resp.status}: {body[:800]}")
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="replace")[:800]
+            log(f"[postdeploy] POST /verify-registered-agent {{agent_id: {test_agent_id}}} -> HTTP {e.code} {e.reason}: {body}")
+            log("[postdeploy] NOTE: this REST endpoint is x402-gated (real USDC charge) -- a 402 Payment Required here is EXPECTED, not a failure. It doesn't tell us whether the underlying ownerOf() call reverts or not, since payment settles before the handler runs. Using the free MCP tool instead (below) to get the real verdict without spending money.")
+        except Exception as e:
+            log(f"[postdeploy] POST /verify-registered-agent failed: {e!r}")
+
+        log("\n=== Step 8b: same check via the FREE MCP tool (real client, real verdict, no payment) ===")
+        try:
+            import asyncio as _asyncio
+
+            async def _mcp_verify(agent_id: int):
+                from mcp import ClientSession
+                from mcp.client.streamable_http import streamablehttp_client
+
+                mcp_url = "https://erc8004-agent-liveness-325572559480.us-central1.run.app/mcp"
+                async with streamablehttp_client(mcp_url) as (read, write, _):
+                    async with ClientSession(read, write) as session:
+                        await session.initialize()
+                        result = await session.call_tool("verify_registered_agent", {"agent_id": agent_id})
+                        return result
+
+            mcp_result = _asyncio.run(_mcp_verify(test_agent_id))
+            log(f"[postdeploy] MCP tool verify_registered_agent(agent_id={test_agent_id}) -> {mcp_result}")
+        except Exception as e:
+            log(f"[postdeploy] MCP tool call failed: {e!r}")
+    else:
+        log("[postdeploy] no real agentId found for any target wallet in ids 1-30 -- skipping live endpoint test, widen the id range")
+
     log("\n=== DONE ===")
 
 
