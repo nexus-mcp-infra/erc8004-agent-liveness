@@ -1,7 +1,7 @@
 # ERC-8004 Agent Liveness
 
 Checks whether an agent registered in the real ERC-8004 "Trustless Agents" Identity Registry (Base
-Sepolia testnet -- see "Chain scope" below for why, despite payment being real USDC on Base mainnet)
+mainnet -- both the payment and the registry read, see "Chain scope" below)
 is actually alive right now -- not just that it was registered once. NEXUS candidate #10 --
 **manual build, not FORGE-generated**, same manual-Cloud-Run-asset pattern as candidates #3/#4/#6/#8/#9/#13/#16.
 
@@ -53,10 +53,27 @@ file (3 URI schemes) and picking a real endpoint out of its `endpoints` array to
 
 ## Chain scope
 
-**Split, deliberately.** x402 payment settles in real USDC on **Base mainnet**. The on-chain
-`IdentityRegistry`/`ReputationRegistry` reads -- the actual identity/liveness check -- are on **Base Sepolia
-testnet**, not mainnet. This asset still doesn't expose a caller-selectable chain -- no evidence a buyer needs
-one for either rail.
+**Unified, as of 2026-09-04.** x402 payment settles in real USDC on **Base mainnet**. The on-chain
+`IdentityRegistry` read -- the actual identity/liveness check -- is now also on **Base mainnet**, against the
+verified `IdentityRegistryUpgradeable` deployment (`0x8004A169FB4a3325136EB29fA0ceB6D2e539a432`) -- see
+"Mainnet registry corrected" below. `ReputationRegistry` reads still use the original (Sepolia-verified)
+address -- its real mainnet counterpart was not verified this session, see "Pending". This asset still doesn't
+expose a caller-selectable chain -- no evidence a buyer needs one for either rail.
+
+## Mainnet registry corrected (2026-09-04)
+
+The 2026-09-03 partial revert below was investigating the wrong contract. `0x8004A818BFB912233c491871b3d84c89A494BD9e`
+is itself the deterministic Base SEPOLIA IdentityRegistry address from `erc-8004/erc-8004-contracts`'s
+vanity-address deployment pattern -- it was never the real Base mainnet deployment, which is a *different*
+deterministic address per network. The real Base mainnet IdentityRegistry is
+`0x8004A169FB4a3325136EB29fA0ceB6D2e539a432`: implementation `0x7274e874ca62410a93bd8bf61c69d8045e399c02`
+verified on Etherscan as `IdentityRegistryUpgradeable` (exact name match with the reference repo, compiler
+v0.8.24+commit.e11b9ed9), `ownerOf` reads succeed, and a Basescan export shows 25 real Base mainnet
+transactions against it (2026-09-04 09:02-10:06 UTC, 25/25 successful: 5x `register`, 20x `setMetadata`) --
+versus 19 historical transactions against the old address (2026-01-31 to 2026-04-20), 17/19 reverted. Full
+verification trail: `scripts/verify_mainnet_registry_candidate.py`, branch
+`claude/erc8004-registry-address-verify-u2db8u`. `ReputationRegistry`'s real mainnet address was not verified
+this session -- left unchanged, see "Pending".
 
 ## Mainnet cutover (2026-09-03) and same-day partial revert
 
@@ -81,25 +98,34 @@ by name against unverified mainnet bytecode risked the exact failure this asset 
 its own buyers instead: a plausible wrong answer (`AGENT_NOT_FOUND` for a real agent) charged for as if
 correct.
 
-`BASE_RPC_URL` was reverted to `BASE_SEPOLIA_RPC_URL` (default back to `https://sepolia.base.org`) so the
-registry read is on the chain whose bytecode is actually verified working, while `_X402_NETWORK` and the CDP
-facilitator stay on Base mainnet -- payment did not revert, only the identity check did. Every buyer-facing
-surface (agent-card, OpenAPI descriptions, this README) says this split explicitly rather than implying the
-whole asset moved to mainnet.
+`BASE_RPC_URL` (default `https://mainnet.base.org`) and `_IDENTITY_REGISTRY_ADDRESS`
+(`0x8004A169FB4a3325136EB29fA0ceB6D2e539a432`) now both point at the real, verified Base mainnet
+IdentityRegistry -- see "Mainnet registry corrected" above. No CDP RPC node pattern exists elsewhere in this
+codebase to reuse (checked `onchain-activity-index`, `x402-receipt-verifier`, `new-x402-listings-feed` --
+none of them read on-chain data via RPC at all, only x402 payment went through CDP), so this reuses the same
+public endpoint and env var name already used once in the original 2026-09-03 cutover attempt. Every
+buyer-facing surface (agent-card, OpenAPI descriptions, this README) has been updated to say both payment and
+the registry read are Base mainnet.
 
-## Pending: confirm the real mainnet implementation before re-attempting this cutover
+## Pending
 
-Not resolved, left open on purpose rather than guessed at:
+Resolved 2026-09-04: the mainnet cutover this section used to say was blocked on decompiling
+`0xd53dE688e0b0ad436FBdbDa00036832FF6499234` -- that turned out to be unnecessary. That address was never the
+real mainnet IdentityRegistry implementation; the real one
+(`0x7274e874ca62410a93bd8bf61c69d8045e399c02`) is independently verified on Etherscan as
+`IdentityRegistryUpgradeable`, and the cutover is done (see "Mainnet registry corrected" above).
 
-- Decompile the bytecode at the mainnet implementation address
-  (`0xd53dE688e0b0ad436FBdbDa00036832FF6499234`) directly, since no verified source exists to read instead, OR
-- Contact the ERC-8004 team/Foundation to ask for the real source/ABI actually deployed on Base mainnet at
-  that implementation address.
+Still open, left explicit rather than guessed at:
 
-Only once one of those confirms the real function names/signatures (which may or may not match
-`ownerOf`/`tokenURI`/`getClients`/`getSummary` from the Sepolia-verified reference source) should the registry
-read be pointed at Base mainnet again -- and even then, re-verify live against real registered mainnet agents
-before trusting it, the same discipline already applied to the original Sepolia grounding.
+- `ReputationRegistry`'s real Base mainnet address was not verified this session -- reputation reads still use
+  the Sepolia-deterministic address over the now-mainnet RPC, which may be wrong. Needs the same
+  bytecode/implementation-verification treatment `IdentityRegistry` just got before it's trusted.
+- `_BASE_RPC` uses the free public `https://mainnet.base.org` -- no SLA. CDP's own SDK (already a dependency
+  here) ships a "Base Node" RPC endpoint reusing the same CDP credentials already configured for the x402
+  facilitator (`cdp.base_node_rpc_url.get_base_node_rpc_url`, verified by reading the actual cdp-sdk source),
+  but switching to it needs an async-startup restructure (today's RPC client is built synchronously at module
+  import) and its plan-tier availability isn't confirmed. Deferred until there's a concrete reliability/cost
+  reason to take that on -- see the comment above `_BASE_RPC` in `main.py`.
 
 ## Deploy target: Cloud Run
 
@@ -176,3 +202,4 @@ lens), run before the first deploy. Real findings, all fixed before going live:
 `traffic_events`/`revenue_events`/`mcp_call_events` (`asset_name = 'erc8004-agent-liveness'`), not Cloud Run
 logs. Day 7: if zero real traffic (filtering crawlers), pause/delete the Cloud Run service
 (`gcloud run services delete erc8004-agent-liveness --region us-central1 --project nexus-505016`).
+<!-- _NEXUS_ERC8004_CDP_NODE_RPC_RESEARCH_NOTE -->

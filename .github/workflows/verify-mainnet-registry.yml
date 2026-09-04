@@ -1,0 +1,39 @@
+name: Verify mainnet registry candidate address
+
+# Manual, read-only verification of a hypothesis about the ERC-8004
+# IdentityRegistry address on Base mainnet -- see
+# scripts/verify_mainnet_registry_candidate.py for what it actually checks
+# and why. Does not touch main.py, does not deploy, does not change any env
+# var used by the running service. Runs on a GitHub-hosted runner because
+# the interactive session that authored this workflow has no network path
+# to any blockchain RPC or explorer.
+on:
+  workflow_dispatch: {}
+  # workflow_dispatch alone won't register until this file is on the
+  # default branch. Trigger on push to this verification branch instead,
+  # scoped to the files this check actually needs, so it fires from CI
+  # (real internet access) without requiring a merge to main.
+  push:
+    branches:
+      - claude/erc8004-registry-address-verify-u2db8u
+    paths:
+      - scripts/verify_mainnet_registry_candidate.py
+      - .github/workflows/verify-mainnet-registry.yml
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install pinned web3
+        run: pip install web3==7.16.0
+
+      - name: Run verification script
+        env:
+          BASESCAN_API_KEY: ${{ secrets.BASESCAN_API_KEY }}
+        run: python scripts/verify_mainnet_registry_candidate.py
