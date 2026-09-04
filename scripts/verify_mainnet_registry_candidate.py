@@ -234,6 +234,54 @@ def find_real_agent_ids(w3, from_block, latest_block):
     return found
 
 
+def find_real_agent_ids_via_api(addr, label, from_block, latest_block):
+    """eth_getLogs via Etherscan v2's proxy module (module=proxy, same module
+    that already worked for eth_getTransactionReceipt) instead of the free
+    public RPC, which 429'd on every prior run. Uses the block range already
+    validated against real timestamps in step 4a -- not re-derived here."""
+    api_key = _basescan_api_key()
+    if not api_key:
+        log(f"[api-logs] {label}: no BASESCAN_API_KEY -- skipping")
+        return []
+    url = (
+        "https://api.etherscan.io/v2/api"
+        f"?chainid=8453&module=proxy&action=eth_getLogs"
+        f"&fromBlock={hex(from_block)}&toBlock={hex(latest_block)}"
+        f"&address={addr}&topic0={TRANSFER_TOPIC}"
+        f"&apikey={api_key}"
+    )
+    try:
+        with urllib.request.urlopen(url, timeout=30) as resp:
+            data = json.loads(resp.read())
+    except urllib.error.URLError as e:
+        log(f"[api-logs] {label}: request failed: {e!r}")
+        return []
+
+    result = data.get("result")
+    if isinstance(result, str):
+        # proxy module surfaces errors as a string result (e.g. range too large)
+        log(f"[api-logs] {label}: error/message result: {result!r} (full response: {data})")
+        return []
+    if not isinstance(result, list):
+        log(f"[api-logs] {label}: unexpected response: {data}")
+        return []
+
+    log(f"[api-logs] {label} ({addr}): {len(result)} Transfer-topic log(s) found via Etherscan API, block {from_block}-{latest_block}")
+    found = []
+    for entry in result:
+        topics = entry.get("topics", [])
+        if len(topics) != 4:
+            continue
+        token_id = int(topics[3], 16)
+        owner = "0x" + topics[2][-40:]
+        frm = "0x" + topics[1][-40:]
+        tx_hash = entry.get("transactionHash")
+        block_num = int(entry.get("blockNumber", "0x0"), 16)
+        log(f"[api-logs]   agentId={token_id} from={frm} to={owner} tx={tx_hash} block={block_num}")
+        found.append({"agentId": token_id, "owner": owner, "from": frm, "txHash": tx_hash, "blockNumber": block_num})
+    return found
+
+
 def try_reads(w3, label, addr, agent_ids):
     contract = w3.eth.contract(address=addr, abi=MINIMAL_ABI)
     for tid in agent_ids:
@@ -418,14 +466,18 @@ def main():
     verified_from_ts = get_block_with_retry(verified_from_block)["timestamp"]
     log(f"[blocktime] timestamp-verified from_block={verified_from_block} @ {datetime.datetime.utcfromtimestamp(verified_from_ts).isoformat()}Z (target: 6 days before latest)")
 
-    log("\n=== Step 4: real agentIds from register() event logs (CURRENT address, mainnet, timestamp-verified range) ===")
-    found = find_real_agent_ids(w3, verified_from_block, latest)
+    log("\n=== Step 4: real agentIds from register()/Transfer event logs, BOTH addresses, via Etherscan proxy module (not the rate-limited public RPC) ===")
+    found_current = find_real_agent_ids_via_api(CURRENT_ADDR, "CURRENT", verified_from_block, latest)
+    time.sleep(0.5)
+    found_candidate = find_real_agent_ids_via_api(CANDIDATE_ADDR, "CANDIDATE", verified_from_block, latest)
+    found = found_current + found_candidate
     if found:
         agent_ids = sorted({f["agentId"] for f in found})[:8]
         log(f"[logs] using REAL agentIds extracted from logs for read test: {agent_ids}")
+        log(f"[logs] SUMMARY: {len(found_current)} real Transfer mint(s) landed on CURRENT, {len(found_candidate)} landed on CANDIDATE")
     else:
         agent_ids = [1, 2, 3]
-        log(f"[logs] WARNING: no mint logs found in scanned range -- falling back to ASSUMED sequential ids {agent_ids} (NOT extracted from logs, treat read results below as lower-confidence)")
+        log(f"[logs] WARNING: no mint logs found on EITHER address in the timestamp-verified range -- falling back to ASSUMED sequential ids {agent_ids} (NOT extracted from logs, treat read results below as lower-confidence)")
 
     log("\n=== Step 5: ownerOf/balanceOf reads against BOTH addresses ===")
     if candidate_len == 0:
@@ -437,34 +489,20 @@ def main():
     else:
         try_reads(w3, "CURRENT", CURRENT_ADDR, agent_ids)
 
-    log("\n=== Step 6: real tx history + real receipts (Basescan-indexed, no assumed range) ===")
-    current_txs = fetch_txlist(CURRENT_ADDR, "CURRENT")
-    time.sleep(1)
-    candidate_txs = fetch_txlist(CANDIDATE_ADDR, "CANDIDATE")
-
-    has_key = bool(_basescan_api_key())
-
-    successful_current = [t for t in current_txs if t.get("isError") == "0"]
-    log(f"[txlist] CURRENT: {len(successful_current)} successful tx(s) out of {len(current_txs)} total")
-    for tx in successful_current:
-        if has_key:
-            r = fetch_receipt_via_api(tx["hash"])
-            decode_receipt_json(r, CURRENT_ADDR, tx["hash"])
-            time.sleep(0.3)
-        else:
-            decode_receipt(w3, tx["hash"], CURRENT_ADDR)
-            time.sleep(0.5)
-
-    successful_candidate = [t for t in candidate_txs if t.get("isError") == "0"]
-    log(f"[txlist] CANDIDATE: {len(successful_candidate)} successful tx(s) out of {len(candidate_txs)} total")
-    for tx in successful_candidate:
-        if has_key:
-            r = fetch_receipt_via_api(tx["hash"])
-            decode_receipt_json(r, CANDIDATE_ADDR, tx["hash"])
-            time.sleep(0.3)
-        else:
-            decode_receipt(w3, tx["hash"], CANDIDATE_ADDR)
-            time.sleep(0.5)
+    log("\n=== Step 6: real receipts for any tx hashes found via step 4's log scan ===")
+    log("[txlist] account-module txlist confirmed paywalled on this Etherscan plan for Base (run 4: "
+        "'Free API access is not supported for this chain') -- not retrying it per instruction. "
+        "Using the real tx hashes decoded from step 4's Transfer logs instead.")
+    for f in found_current:
+        r = fetch_receipt_via_api(f["txHash"])
+        decode_receipt_json(r, CURRENT_ADDR, f["txHash"])
+        time.sleep(0.3)
+    for f in found_candidate:
+        r = fetch_receipt_via_api(f["txHash"])
+        decode_receipt_json(r, CANDIDATE_ADDR, f["txHash"])
+        time.sleep(0.3)
+    if not found_current and not found_candidate:
+        log("[txlist] no Transfer logs found on either address in step 4 -- nothing to fetch receipts for")
 
     log("\n=== DONE ===")
 
